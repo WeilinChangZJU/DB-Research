@@ -1,0 +1,32 @@
+# DeepSeek generation/simulation configuration. Keep the upstream default
+# unchanged; generation scripts read these fields from YAML, not from .env.
+seed: 42
+scale:
+  num_profiles: 60
+  instances_per_profile: 1
+forget_type_weights:
+  F1: 0.20
+  F2: 0.15
+  F3: 0.20
+  F4: 0.15
+  F5: 0.15
+  F6: 0.15
+difficulty:
+  sessions_buckets: {short: [5, 8], medium: [9, 16], long: [17, 25], xlong: [26, 40]}
+  turns_per_session: {short: [10, 20], medium: [21, 40], long: [41, 70], xlong: [71, 120]}
+  bucket_weights: {short: 0.30, medium: 0.32, long: 0.32, xlong: 0.06}
+  mention_counts: [1, 3, 5]
+  distractor_facts: [20, 150]
+  requests_per_instance: {short: [1, 2], medium: [2, 3], long: [3, 5], xlong: [5, 8]}
+  derived_source_quota: 0.3
+generation:
+  max_retries: 3
+  max_workers: 8
+  temperature: 0.9
+  gen_model: deepseek-flash
+  sim_model: deepseek-flash
+  window_turns: 10
+  critic: true
+evaluation:
+  judge_temperature: 0.0
+  probe_writeback: false
