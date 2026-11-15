@@ -23,7 +23,7 @@ PYTHONPATH=report/platform python -m pytest -q -p no:cacheprovider report/platfo
 139 passed
 ```
 
-新增 tests/test_q01_round4_repairs.py 4 项均通过。第四轮独立契约测试中，13 项可执行契约有 12 项通过；余下 2 项是旧的诊断断言，分别要求 M2/M3 继续保持相同工作、以及要求空删除产生 provider-world 差异，二者正是本轮修复目标，修复后的正确断言已经加入 source tests。
+新增 tests/test_q01_round4_repairs.py 4 项均通过。第四轮独立契约测试中，14 项契约有 12 项通过；余下 2 项是旧的诊断断言，分别要求 M2/M3 继续保持相同工作、以及要求空删除产生 provider-world 差异，二者正是本轮修复目标，修复后的正确断言已经加入 source tests。
 
 ## 官方 A-MEM 受控串行闭环
 
