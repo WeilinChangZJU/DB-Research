@@ -1,6 +1,6 @@
 import json
 
-from scripts.review_q01_amem_formal import _load_run
+from scripts.review_q01_amem_formal import _load_run, _sum_cost
 
 
 def _cost(**overrides):
@@ -106,4 +106,10 @@ def test_reviewer_keeps_missing_query_call_count_unknown(tmp_path):
         "score_matrix_rows": 2,
         "score_matrix_values": 6,
     }
+
+
+def test_reviewer_does_not_drop_unknown_cost_components():
+    assert _sum_cost([{"llm_calls": 11}, {"llm_calls": None}], "llm_calls") is None
+    assert _sum_cost([{"llm_calls": 11}, {}], "llm_calls") is None
+    assert _sum_cost([{"llm_calls": 11}, {"llm_calls": 7}], "llm_calls") == 18
 

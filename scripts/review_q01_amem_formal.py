@@ -39,6 +39,7 @@ _COST_FIELDS = (
     "generated_objects",
     "state_records",
     "llm_calls",
+    "llm_cache_hits",
     "input_tokens",
     "output_tokens",
     "embedding_calls",
@@ -61,20 +62,60 @@ def _hash(path: Path) -> str:
 
 
 def _sum_cost(costs: list[dict[str, Any]], field: str) -> int | float | None:
-    """Add one numeric cost field while tolerating older/missing receipts."""
+    """Add one numeric cost field without hiding unknown components.
 
-    values = [cost.get(field) for cost in costs]
-    present = [value for value in values if isinstance(value, (int, float)) and not isinstance(value, bool)]
-    if not present:
+    A mixed list such as ``[11, None]`` is not an observed total of ``11``:
+    the missing component is part of the cost ledger and must remain unknown.
+    This conservative rule prevents lifecycle comparisons from silently
+    understating one arm when a provider or checkpoint backend omitted a
+    counter for only some instances.
+    """
+
+    if not costs:
         return None
-    total = sum(present)
+    values = [cost.get(field) for cost in costs]
+    if any(
+        value is None
+        or isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        for value in values
+    ):
+        return None
+    total = sum(values)
     # Keep integer counters as integers in JSON while retaining fractional wall
     # times.  This also makes exact regression assertions straightforward.
-    return int(total) if all(isinstance(value, int) for value in present) else total
+    return int(total) if all(isinstance(value, int) for value in values) else total
 
 
 def _cost_totals(costs: list[dict[str, Any]]) -> dict[str, int | float | None]:
     return {field: _sum_cost(costs, field) for field in _COST_FIELDS}
+
+
+def _cost_coverage(costs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Report whether every row supplied a numeric receipt for each field.
+
+    A lifecycle total is only comparable when its component coverage is
+    explicit.  ``unknown`` is intentionally retained for any missing or
+    non-numeric receipt instead of turning the missing work into zero.
+    """
+
+    coverage: dict[str, dict[str, Any]] = {}
+    expected = len(costs)
+    for field in _COST_FIELDS:
+        observed = sum(
+            isinstance(cost.get(field), (int, float))
+            and not isinstance(cost.get(field), bool)
+            for cost in costs
+        )
+        coverage[field] = {
+            "observed_count": observed,
+            "expected_count": expected,
+            "coverage": (observed / expected) if expected else 0.0,
+            "status": "complete" if expected and observed == expected else (
+                "unknown" if observed < expected else "empty"
+            ),
+        }
+    return coverage
 
 
 def _optional_int(value: Any) -> int | None:
@@ -153,6 +194,20 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
             **{f"maintenance_{field}": value for field, value in maintenance.items()},
             **{f"baseline_setup_{field}": value for field, value in baseline_setup.items()},
             **{f"full_{field}": value for field, value in full.items()},
+            "cost_coverage": {
+                "maintenance": _cost_coverage(costs),
+                "baseline_setup": _cost_coverage(valid_setup_costs),
+                "full": _cost_coverage(
+                    [
+                        {
+                            field: full[field]
+                            for field in _COST_FIELDS
+                        }
+                    ]
+                    if arm_rows
+                    else []
+                ),
+            },
         }
 
     probes = []
@@ -249,11 +304,20 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                     and m3_metadata.get("checkpoint_restored") is True
                 ),
                 "m3_strong_policy": (
-                    m3_metadata.get("m3_mode") == "conservative_full"
-                    and m3_metadata.get("m3_status")
-                    == "strong_conservative_full_history_checkpoint_replay"
-                    and m3_metadata.get("dependency_baseline")
-                    == "complete_conservative_barrier"
+                    (
+                        m3_metadata.get("m3_mode") == "conservative_full"
+                        and m3_metadata.get("m3_status")
+                        == "strong_conservative_full_history_checkpoint_replay"
+                        and m3_metadata.get("dependency_baseline")
+                        == "complete_conservative_barrier"
+                    )
+                    or (
+                        m3_metadata.get("m3_mode") == "recheck"
+                        and m3_metadata.get("m3_status")
+                        == "generic_recheck_request_key_cache"
+                        and m3_metadata.get("dependency_baseline")
+                        == "generic_recheck_request_key_cache"
+                    )
                 ),
                 "query_probe_present": query_present,
             }

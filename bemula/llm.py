@@ -25,13 +25,39 @@ DEFAULT_MAX_TOKENS = 16384
 MIN_MAX_TOKENS = 4096
 
 
+_ENV_LOADED = False
+
+
+def load_environment_once() -> None:
+    """Load ``.env`` without overriding an already frozen process config.
+
+    Formal Q01 runs verify their effective environment before constructing a
+    provider.  Re-reading ``.env`` with ``override=True`` later in adapter or
+    client construction can silently replace that verified endpoint/model.
+    Loading at most once and never overriding process values keeps the
+    effective configuration stable for the lifetime of the process.
+    """
+
+    global _ENV_LOADED
+    if not _ENV_LOADED:
+        load_dotenv(override=False)
+        _ENV_LOADED = True
+
+
 def resolve_endpoint(model: str) -> tuple[str | None, str]:
     """Pick the endpoint credentials for a model.
 
     Every model goes through the single OpenAI-compatible endpoint configured
     via OPENAI_BASE_URL / OPENAI_API_KEY in .env.
     """
-    load_dotenv(override=True)
+    # Keep this function self-contained when the audit harness loads only its
+    # AST body. In normal imports the shared one-time loader is used.
+    loader = globals().get("load_environment_once")
+    if callable(loader):
+        loader()
+    elif not globals().get("_ENV_LOADED", False):
+        load_dotenv(override=False)
+        globals()["_ENV_LOADED"] = True
     base_url = os.environ.get("OPENAI_BASE_URL")
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -50,7 +76,7 @@ def resolve_embed_endpoint(model: str) -> tuple[str | None, str]:
     either field left unset falls back to the standard resolve_endpoint
     routing.
     """
-    load_dotenv(override=True)
+    load_environment_once()
     base_url = os.environ.get("EMBED_PROXY_BASE_URL")
     api_key = os.environ.get("EMBED_PROXY_API_KEY")
     routed_base_url, routed_api_key = resolve_endpoint(model)
@@ -140,7 +166,7 @@ class OpenAILLM(BaseLLM):
     def __init__(self, model: str | None = None, max_retries: int = 3) -> None:
         from openai import OpenAI
 
-        load_dotenv(override=True)
+        load_environment_once()
         self.model = model or os.environ.get("BEMULA_GEN_MODEL", "deepseek-v4-flash")
         base_url, api_key = resolve_endpoint(self.model)
         self.max_retries = max_retries

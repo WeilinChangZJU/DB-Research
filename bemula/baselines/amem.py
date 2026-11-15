@@ -226,12 +226,23 @@ class AmemAdapter(MemoryAdapter):
             clone._progress = TurnProgress("A-MEM", enabled=False)
         clone._system_class = self._system_class
         clone._retriever_class = self._retriever_class
-        clone._system = self._create_system()
+        # Bind the consolidation closure to the clone.  Calling the method on
+        # ``self`` here would leave a closure that recreates retrievers from
+        # the source adapter after a provider/embedder is replaced on the
+        # fork.
+        clone._system = clone._create_system()
         clone.provider_fork_mode = "shared_provider_unreplayed"
         source_system = self._system
         target_system = clone._system
         target_system.memories = copy.deepcopy(getattr(source_system, "memories", {}))
         target_system.retriever = copy.deepcopy(getattr(source_system, "retriever", None))
+        # ``deepcopy(retriever)`` also copies the embedding wrapper and its
+        # provider reference.  Rebind the copied wrapper to the fork's
+        # provider so actual encode calls and the fork's cost counters observe
+        # the same object.  Mutable index arrays and document maps remain
+        # isolated by the deepcopy above.
+        if target_system.retriever is not None:
+            target_system.retriever.model = _APIEmbeddingModel(clone.embedder)
         target_system.refresh_index = getattr(source_system, "refresh_index", False)
         target_system.evo_cnt = getattr(source_system, "evo_cnt", 0)
         target_system.evo_threshold = getattr(source_system, "evo_threshold", 100)

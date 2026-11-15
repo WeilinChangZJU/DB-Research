@@ -73,6 +73,12 @@ class DependencyGraph:
             str(key): str(value)
             for key, value in (event.metadata.get("candidate_versions", {}) or {}).items()
         }
+        event_kind = event.event_type.value
+        # READ/SELECT events consume object versions.  They must point from
+        # the object into the decision; treating every ``object_ids`` field as
+        # a write output creates a false decision -> object edge and, together
+        # with the selected-object edge below, a pseudo-cycle for every read.
+        read_event = event_kind in {"read", "select"}
 
         def versioned(value: str, versions: Mapping[str, str]) -> str:
             normalized = self._normalize_object_id(value)
@@ -105,10 +111,12 @@ class DependencyGraph:
         for object_id in event.object_ids:
             normalized_object = self._normalize_object_id(object_id)
             versioned_object = versioned(object_id, object_versions)
-            self.add(DependencyEdge(decision_id, normalized_object, "decision_object", event.step, event.query_id))
-            if versioned_object != normalized_object:
-                self.add(DependencyEdge(decision_id, versioned_object, "decision_object_version", event.step, event.query_id))
-        event_kind = event.event_type.value
+            if read_event:
+                self.add(DependencyEdge(versioned_object, decision_id, "read_object", event.step, event.query_id))
+            else:
+                self.add(DependencyEdge(decision_id, normalized_object, "decision_object", event.step, event.query_id))
+                if versioned_object != normalized_object:
+                    self.add(DependencyEdge(decision_id, versioned_object, "decision_object_version", event.step, event.query_id))
         output_ids = {self._normalize_object_id(value) for value in event.object_ids}
         for candidate_id in event.candidate_ids:
             normalized_candidate = self._normalize_object_id(candidate_id)
@@ -131,6 +139,12 @@ class DependencyGraph:
         # unversioned decision <-> object cycle and is not an execution DAG.
         if event_kind not in {"write", "update"}:
             for selected_id in event.selected_ids:
+                if read_event and self._normalize_object_id(selected_id) in {
+                    self._normalize_object_id(value) for value in event.object_ids
+                }:
+                    # The object_ids edge above already captures this read;
+                    # avoid a second edge with a competing semantic kind.
+                    continue
                 self.add(DependencyEdge(candidate_node(selected_id), decision_id, "selected_decision", event.step, event.query_id))
         for control_id in event.control_dependencies:
             normalized_control = self._normalize_object_id(control_id)

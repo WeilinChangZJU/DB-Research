@@ -116,6 +116,13 @@ class AmemResearchWrapper(MemoryBackend):
         self._llm_trace: list[dict[str, Any]] = []
         self._query_records: list[CanonicalQuery] = []
         self._logical_ids: dict[str, str] = {}
+        # Stable creation identity is derived from the external source event
+        # and output slot, never from a physical note/storage identifier.
+        self._logical_origins: dict[str, str] = {}
+        # Request-keyed provider responses are copied with a runtime fork.
+        # Recheck policies may reuse an unchanged response, but always execute
+        # the current write logic against the restored state.
+        self._response_cache: dict[str, str] = {}
         # Physical object IDs can be updated in place by A-MEM.  Keep the
         # version visible in dependency traces so an update reads the old
         # version and writes a new one instead of creating a self-cycle.
@@ -162,6 +169,8 @@ class AmemResearchWrapper(MemoryBackend):
         clone._llm_trace = copy.deepcopy(self._llm_trace)
         clone._query_records = copy.deepcopy(self._query_records)
         clone._logical_ids = copy.deepcopy(self._logical_ids)
+        clone._logical_origins = copy.deepcopy(self._logical_origins)
+        clone._response_cache = copy.deepcopy(self._response_cache)
         clone._object_versions = copy.deepcopy(self._object_versions)
         clone._trace_context = copy.deepcopy(self._trace_context)
         clone._checkpoints = {}
@@ -180,9 +189,13 @@ class AmemResearchWrapper(MemoryBackend):
             )
         clone = checkpoint.fork(trace=trace)
         try:
-            checkpoint_bytes = len(json.dumps(checkpoint.canonical_snapshot().model_dump(mode="json"), ensure_ascii=False))
+            checkpoint_payload = json.dumps(
+                checkpoint.canonical_snapshot().model_dump(mode="json"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            checkpoint_bytes = len(checkpoint_payload)
         except Exception:
-            checkpoint_bytes = len(repr(checkpoint._system()))
+            checkpoint_bytes = len(repr(checkpoint._system()).encode("utf-8"))
         return clone, checkpoint_bytes
 
     def set_trace_context(self, **fields: Any) -> None:
@@ -395,6 +408,7 @@ class AmemResearchWrapper(MemoryBackend):
             call_kind: str,
             temperature: Any = None,
             task: str | None = None,
+            cache_hit: bool = False,
         ) -> dict[str, Any]:
             response_text = str(response)
             entry: dict[str, Any] = {
@@ -409,6 +423,7 @@ class AmemResearchWrapper(MemoryBackend):
                 "input_tokens": usage_value(usage, "prompt_tokens", "input_tokens"),
                 "output_tokens": usage_value(usage, "completion_tokens", "output_tokens"),
                 "usage_observed": bool(usage),
+                "cache_hit": cache_hit,
             }
             if usage:
                 entry["usage"] = dict(usage)
@@ -425,8 +440,22 @@ class AmemResearchWrapper(MemoryBackend):
 
         def wrapped(prompt: str, temperature: float = 0.7, *args: Any, **kwargs: Any) -> str:
             prompt_hash = _hash_text(str(prompt))
-            response = completion(prompt, *args, temperature=temperature, **kwargs)
-            usage = dict(getattr(llm, "last_usage", {}) or {})
+            call_kind = self._call_kind(str(prompt))
+            cache_key = _hash_text(
+                json.dumps(
+                    {"prompt_hash": prompt_hash, "temperature": temperature, "call_kind": call_kind},
+                    sort_keys=True,
+                )
+            )
+            cache_hit = cache_key in self._response_cache
+            if cache_hit:
+                response = self._response_cache[cache_key]
+                usage = {}
+            else:
+                response = completion(prompt, *args, temperature=temperature, **kwargs)
+                response = str(response)
+                self._response_cache[cache_key] = response
+                usage = dict(getattr(llm, "last_usage", {}) or {})
             # This fallback is used only when no provider-level ``chat`` hook
             # exists.  When both surfaces exist, wrapping both would count the
             # same provider request twice because get_completion delegates to
@@ -435,9 +464,10 @@ class AmemResearchWrapper(MemoryBackend):
                 response=response,
                 prompt_hash=prompt_hash,
                 usage=usage,
-                call_kind=self._call_kind(str(prompt)),
+                call_kind=call_kind,
                 temperature=temperature,
                 task="amem_internal",
+                cache_hit=cache_hit,
             )
             return str(response)
 
@@ -445,20 +475,35 @@ class AmemResearchWrapper(MemoryBackend):
             # Record once at the provider boundary.  The same hook sees both
             # A-MEM internal calls (task=amem_internal) and answer calls; the
             # nested get_completion wrapper is deliberately not installed.
-            response = adapter_chat(messages, *args, **kwargs)
-            usage = dict(getattr(adapter_llm, "last_usage", {}) or {})
             prompt_hash = _hash_text(repr(messages))
             task = str(kwargs.get("task", ""))
             call_kind = "query_answer" if task in {"", "amem_answer"} else (
                 "amem_internal" if task == "amem_internal" else self._call_kind(repr(messages))
             )
+            temperature = kwargs.get("temperature")
+            cache_key = _hash_text(
+                json.dumps(
+                    {"prompt_hash": prompt_hash, "temperature": temperature, "call_kind": call_kind},
+                    sort_keys=True,
+                )
+            )
+            cache_hit = cache_key in self._response_cache
+            if cache_hit:
+                response = self._response_cache[cache_key]
+                usage = {}
+            else:
+                response = adapter_chat(messages, *args, **kwargs)
+                response = str(response)
+                self._response_cache[cache_key] = response
+                usage = dict(getattr(adapter_llm, "last_usage", {}) or {})
             record_provider_call(
                 response=response,
                 prompt_hash=prompt_hash,
                 usage=usage,
                 call_kind=call_kind,
-                temperature=kwargs.get("temperature"),
+                temperature=temperature,
                 task=task or call_kind,
+                cache_hit=cache_hit,
             )
             return response
 
@@ -494,6 +539,7 @@ class AmemResearchWrapper(MemoryBackend):
             "context_coverage": False,
             "context_coverage_ratio": 0.0,
             "lineage_coverage": False,
+            "lineage_ambiguous": False,
             "retrieval_score_coverage": False,
             "unmapped_context_hash": None,
             # ``score_indices`` is an audit hook rather than part of the
@@ -531,6 +577,15 @@ class AmemResearchWrapper(MemoryBackend):
                     matches.append((position, position + len(content), note_id))
                     start = position + max(1, len(content))
             matches.sort(key=lambda item: (item[0], -(item[1] - item[0]), item[2]))
+            ambiguous_note_ids: set[str] = set()
+            for index, (start, end, note_id) in enumerate(matches):
+                same_span = {
+                    candidate_note
+                    for other_start, other_end, candidate_note in matches[index:]
+                    if other_start == start and other_end == end
+                }
+                if len(same_span) > 1:
+                    ambiguous_note_ids.update(same_span)
             selected_matches: list[tuple[int, int, str]] = []
             covered_until = -1
             for start, end, note_id in matches:
@@ -538,7 +593,9 @@ class AmemResearchWrapper(MemoryBackend):
                     continue
                 selected_matches.append((start, end, note_id))
                 covered_until = end
-            context_ids = sorted({note_id for _, _, note_id in selected_matches})
+            context_ids = sorted(
+                {note_id for _, _, note_id in selected_matches} | ambiguous_note_ids
+            )
             intervals = [(start, end) for start, end, _ in selected_matches]
             unknown_parts: list[str] = []
             cursor = 0
@@ -550,10 +607,15 @@ class AmemResearchWrapper(MemoryBackend):
                 unknown_parts.append(rendered[cursor:])
             unknown_text = "".join(unknown_parts)
             unknown_non_ws = "".join(character for character in unknown_text if not character.isspace())
-            mapped_chars = sum(end - start for start, end in intervals)
+            mapped_chars = sum(
+                1
+                for start, end in intervals
+                for character in rendered[start:end]
+                if not character.isspace()
+            )
             non_ws_chars = sum(1 for character in rendered if not character.isspace())
             context_coverage = not unknown_non_ws
-            lineage_coverage = context_coverage and all(
+            lineage_coverage = context_coverage and not ambiguous_note_ids and all(
                 bool(self._object_support.get(note_id)) for note_id in context_ids
             )
             captured["context_object_ids"] = context_ids
@@ -568,6 +630,7 @@ class AmemResearchWrapper(MemoryBackend):
                 float(mapped_chars) / float(non_ws_chars) if non_ws_chars else 1.0
             )
             captured["lineage_coverage"] = lineage_coverage
+            captured["lineage_ambiguous"] = bool(ambiguous_note_ids)
             captured["unmapped_context_hash"] = _hash_text(unknown_text) if unknown_text else None
 
         def score_indices(query: str, indices: Any) -> None:
@@ -737,14 +800,6 @@ class AmemResearchWrapper(MemoryBackend):
             note_id for note_id in before_ids & after_ids
             if before[note_id].model_dump(mode="json") != after[note_id].model_dump(mode="json")
         )
-        # Establish physical-ID-independent identity at first materialization.
-        # Later content/timestamp changes create new versions of the same
-        # logical object instead of changing the identity based on when a
-        # snapshot happened to be taken.
-        for object_id in new_ids:
-            record = after.get(object_id)
-            if record is not None:
-                self._ensure_logical_id(object_id.removeprefix("note:"), record)
         object_ids = [item.removeprefix("note:") for item in new_ids + changed_ids]
         # A NOOP is an execution decision and must not fabricate a materialized
         # object by attaching the input to an arbitrary existing note.
@@ -762,6 +817,18 @@ class AmemResearchWrapper(MemoryBackend):
         }
         for object_id in object_ids:
             self._object_support.setdefault(object_id, set()).update(support_sources)
+        # Establish physical-ID-independent identity only after the current
+        # source support is known. Deriving identity before this update made
+        # same-content notes from different source events collapse to one
+        # canonical ID, which in turn hid retargeted links.
+        for output_slot, object_id in enumerate(new_ids):
+            record = after.get(object_id)
+            if record is not None:
+                self._logical_origins.setdefault(
+                    object_id,
+                    f"source:{sid}:output:{output_slot}",
+                )
+                self._ensure_logical_id(object_id.removeprefix("note:"), record)
         if captured_candidates:
             candidate_support = sorted({
                 source
@@ -962,10 +1029,14 @@ class AmemResearchWrapper(MemoryBackend):
         existing = self._logical_ids.get(note_id)
         if existing:
             return existing
+        origin = self._logical_origins.get(note_id)
         seed = "|".join(
             [
+                origin or "",
                 _hash_text(record.content),
                 ",".join(sorted(record.support_set)),
+                str(record.timestamp or ""),
+                str(record.kind or ""),
             ]
         )
         logical = f"note-sem:{_hash_text(seed)[:24]}"
@@ -1029,6 +1100,7 @@ class AmemResearchWrapper(MemoryBackend):
                     timestamp=record.timestamp,
                     support_set=list(record.support_set),
                     parent_ids=self._logical_links(note_id, record),
+                    retrieval_parent_ids=self._logical_links(note_id, record),
                     visible=True,
                     status="active",
                     metadata=metadata,
@@ -1205,6 +1277,10 @@ class AmemHistoryResult:
     cost: BuildCost
     wrapper: AmemResearchWrapper
     metadata: dict[str, Any]
+    # M0 carries an independently rebuilt runtime so query continuation can
+    # use the same oracle discipline as the state comparison. This is an
+    # in-memory handle and is deliberately excluded from serialized metadata.
+    reference_repeat_wrapper: AmemResearchWrapper | None = None
 
     @property
     def canonical_state(self) -> CanonicalState:
@@ -1229,7 +1305,7 @@ class AmemHistoryBuilder:
         self.retrieve_k = retrieve_k
         self.trace = trace
         self.trace_context = dict(trace_context or {})
-        if m3_mode not in {"materialized", "conservative_full"}:
+        if m3_mode not in {"materialized", "conservative_full", "recheck"}:
             raise ValueError(f"unknown m3_mode: {m3_mode}")
         self.m3_mode = m3_mode
 
@@ -1386,6 +1462,11 @@ class AmemHistoryBuilder:
             llm_calls=sum(
                 1 for event in new_events if event.event_type is ProvenanceEventType.LLM_CALL
             ),
+            llm_cache_hits=sum(
+                bool(event.metadata.get("cache_hit"))
+                for event in new_events
+                if event.event_type is ProvenanceEventType.LLM_CALL
+            ),
             input_tokens=self._usage_total(wrapper, "input_tokens", new_events),
             output_tokens=self._usage_total(wrapper, "output_tokens", new_events),
             memory_reads=sum(
@@ -1499,6 +1580,12 @@ class AmemHistoryBuilder:
                 # retained event from the empty runtime checkpoint.
                 start = 0
                 replay_mode = "conservative_full_history"
+            elif self.m3_mode == "recheck":
+                # Restore the materialized invalidation boundary, re-run the
+                # current retrieval/control/write logic, and reuse only exact
+                # request-key responses inherited from the shared baseline.
+                start = materialized_start
+                replay_mode = "generic_recheck_safe_reuse"
             else:
                 start = materialized_start
                 replay_mode = "read_control_closure"
@@ -1521,6 +1608,8 @@ class AmemHistoryBuilder:
                     (
                         "strong_conservative_full_history_checkpoint_replay"
                         if self.m3_mode == "conservative_full"
+                        else "generic_recheck_request_key_cache"
+                        if self.m3_mode == "recheck"
                         else "limited_materialized_read_control_checkpoint_replay"
                     )
                     if arm is MaintenanceArm.M3_READ_SET
@@ -1531,6 +1620,8 @@ class AmemHistoryBuilder:
                 "dependency_baseline": (
                     "complete_conservative_barrier"
                     if arm is MaintenanceArm.M3_READ_SET and self.m3_mode == "conservative_full"
+                    else "generic_recheck_request_key_cache"
+                    if arm is MaintenanceArm.M3_READ_SET and self.m3_mode == "recheck"
                     else "materialized_read_control_set"
                     if arm is MaintenanceArm.M3_READ_SET
                     else None
@@ -1538,6 +1629,8 @@ class AmemHistoryBuilder:
                 "checkpoint_restored": True,
                 "checkpoint_source": "shared_baseline_runtime",
                 "checkpoint_event": start,
+                "checkpoint_restore_size_kind": "semantic_snapshot_utf8_bytes",
+                "checkpoint_restore_scope": "canonical_state_estimate",
             }
         )
         suffix_replayed = suffix_result.cost.replayed_events
@@ -1813,6 +1906,8 @@ def run_amem_all_arms(
                 reason="equal" if diff.equivalent else "canonical state differs",
             ),
         )
+        if arm is MaintenanceArm.M0_FULL_REBUILD:
+            result.reference_repeat_wrapper = reference_repeat.wrapper
     return output
 
 

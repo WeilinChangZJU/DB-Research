@@ -206,6 +206,12 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--retrieve-k", type=int, default=10)
+    parser.add_argument(
+        "--m3-mode",
+        choices=("materialized", "recheck", "conservative_full"),
+        default="materialized",
+        help="M3 dependency policy; recheck enables request-key reuse over a generic re-evaluation.",
+    )
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     if not OFFICIAL_REPO.is_dir():
@@ -226,6 +232,7 @@ def main() -> int:
         "official_amem_robust_sha256": sha256_file(OFFICIAL_REPO / "memory_layer_robust.py"),
         "histories_sha256": sha256_file(args.histories),
         "retrieve_k": args.retrieve_k,
+        "m3_mode": args.m3_mode,
         "repository_tree_sha256": sha256_tree(root, exclude=(".venv", ".git", "results")),
         "scripted_model": ScriptedOfficialLLM.model,
         "embedding": {"backend": "hash", "dimension": HashEmbedder.dimension},
@@ -264,6 +271,7 @@ def main() -> int:
                 "scenario_id": instance["instance_id"],
                 "selection": instance.get("selection", {}),
             },
+            m3_mode=args.m3_mode,
         )
         # Probe the actual serving path after maintenance.  The question is a
         # hash-stable snippet of the deleted event, so the probe can detect
@@ -405,6 +413,7 @@ def main() -> int:
                 "num_instances": len(store.completed_ids(validate=True)),
                 "resume": args.resume,
                 "retrieve_k": args.retrieve_k,
+                "m3_mode": args.m3_mode,
             },
             extra={"run_fingerprint_sha256": store.load_fingerprint()["sha256"]},
         ),

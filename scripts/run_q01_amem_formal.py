@@ -193,7 +193,7 @@ def main() -> int:
     parser.add_argument("--retrieve-k", type=int, default=10)
     parser.add_argument(
         "--m3-mode",
-        choices=("materialized", "conservative_full"),
+        choices=("materialized", "recheck", "conservative_full"),
         default="conservative_full",
         help="M3 dependency policy; conservative_full is the correctness baseline.",
     )

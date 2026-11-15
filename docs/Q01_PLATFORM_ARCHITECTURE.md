@@ -41,7 +41,8 @@ CanonicalVisible(M_inc) == CanonicalVisible(M_ref)
   删除命中 support 的物化对象并同步 live serving/index；它不等于 exact
   source-only deletion；
 - M2 Replay/repair-all：从最早受影响事件重放或修复所有 provenance 后继；
-- M3 Exact read-set/control-dependency：基于真实读取和控制分支，保守重查可能变化的节点；
+- M3 Generic recheck：从可执行 checkpoint 的物化失效边界重新评估检索、控制和写入，并只复用冻结请求键下的相同模型响应；
+- M3 Materialized：基于已观测读取/控制闭包的有限诊断策略；
 - U Candidate：只有 M0–M3 建立正确性和成本空间后才进入。
 
 所有维护臂都返回统一的 state snapshot、decision trace、cost vector、failure list 和 optional certificate。旧 `scripts.run_eval` 不被修改。
@@ -84,8 +85,9 @@ CanonicalVisible(M_inc) == CanonicalVisible(M_ref)
 已完成测量基础与离线闭环：manifest、checkpoint、trace、ResearchProtocol、
 MemoryBackend、InMemoryBackend、LoCoMo/LongMemEval-S adapter、canonical
 state、dependency trace、M0–M3 maintenance API、cost vector、toy builder、
-source-level paired runner 和统一回归测试。当前平台套件为 96 项通过，
-第二轮独立审计契约在更新过时诊断断言后为 20 项通过。
+source-level paired runner 和统一回归测试。第三轮修复后 Windows 源码套件
+为 123 项通过，第三轮独立契约为 18 项通过。该结果只证明工程契约和
+确定性路径，不证明真实模型上的科学优势。
 
 LoCoMo 与 LongMemEval-S 已各完成一个无模型 controlled-replay pilot；这
 些 pilot 只验证 source overlay、mask、canonical state 和成本输出，不能
@@ -96,5 +98,5 @@ LoCoMo 与 LongMemEval-S 已各完成一个无模型 controlled-replay pilot；�
 
 `scripts/run_q01_amem_paired.py` 是 A-MEM source-event 闭环入口。它读取每行一个独立 history 的 JSONL，要求显式提供 `deleted_source_ids`，在同一 `H,D` 上串行运行两次独立 M0、一个共享 baseline 和 M1--M3，并写出每个 arm 的 canonical hash、状态差异、trace、成本、checkpoint 和运行 fingerprint。查询探针默认只选一个声明问题，必须通过 `--query-limit` 显式扩大；串行是第一轮的安全默认值，A-MEM adapter 是可变对象，未完成独占 worker 验证前不启用并发。
 
-M2 从共享 baseline 的运行时 checkpoint 恢复到最早删除源之前，再执行保留后缀。M3 支持两种明确模式：`materialized` 使用已物化 read/control closure，`conservative_full` 从空运行时 checkpoint 重执行全部保留事件，作为不会漏掉隐藏 NOOP/查询依赖的正确性基线；正式 runner 默认后者。两者都把 `checkpoint_restore_events`、`checkpoint_restore_bytes` 和实际后缀执行单独计入 `maintenance_checkpoint_replay`，不会把保存语义 JSON 冒充可恢复执行状态。`materialized` 模式明确标记为 `limited_materialized_read_control_checkpoint_replay`；`conservative_full` 标记为 `strong_conservative_full_history_checkpoint_replay`，但它的成本接近完整重建，不能被解释为已经获得通用依赖优化。
+M2 从共享 baseline 的运行时 checkpoint 恢复到最早删除源之前，再执行保留后缀。M3 支持三种明确模式：`materialized` 使用已物化 read/control closure；`recheck` 从物化失效边界重新执行当前检索、控制和写入，并复用冻结请求键的已有响应；`conservative_full` 从空运行时 checkpoint 重执行全部保留事件，作为不会漏掉隐藏 NOOP/查询依赖的正确性基线。正式 runner 默认后者。三种模式都把 `checkpoint_restore_events`、`checkpoint_restore_bytes`、`llm_cache_hits` 和实际后缀执行单独计入 `maintenance_checkpoint_replay`，不会把保存语义 JSON 冒充可恢复执行状态。`materialized` 标记为 `limited_materialized_read_control_checkpoint_replay`；`recheck` 标记为 `generic_recheck_request_key_cache`；`conservative_full` 标记为 `strong_conservative_full_history_checkpoint_replay`。前两者都不能被解释为已经获得完整通用依赖优化，后者的成本通常接近完整重建。
 

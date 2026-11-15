@@ -14,9 +14,12 @@ call-kind and conservative branch labels such as `NO_EVOLUTION` without
 persisting raw prompt or response text. Retrieval candidates are captured at
 the `find_related_memories`/retriever boundary and are mapped back from
 A-MEM's integer positions to note IDs. `canonical_snapshot()` normalizes
-physical note UUIDs into semantic IDs and preserves query candidate/selected
-order. `introspect()` exposes the forward and reverse dependency maps and the
-trace quality.
+physical note UUIDs into semantic IDs while retaining source/time/origin
+distinctions, and preserves ordered retrieval parent links. `introspect()`
+exposes the forward and reverse dependency maps and the trace quality. Query
+evidence signatures use a UUID-invariant source payload; when the final
+rendered context cannot be mapped to sources without ambiguity, evidence is
+explicitly incomplete rather than treated as exact.
 
 The trace is explicitly labelled `wrapper_delta`. The stock adapter does not
 expose its parsed branch as a stable public API, so the wrapper's branch labels
@@ -61,7 +64,7 @@ the official A-MEM repository nor a model client. The expected contract is:
 | M3 | replay from the observed dependency boundary | exact to M0 |
 
 M2 restores the checkpoint immediately before the earliest deleted source and
-replays the retained suffix. The runner exposes two explicit M3 policies. The
+replays the retained suffix. The runner exposes three explicit M3 policies. The
 default formal policy, `m3_mode=conservative_full`, restores the empty
 checkpoint and replays the complete retained history; this is a conservative
 correctness baseline with a separate `maintenance_checkpoint_replay` cost and
@@ -72,6 +75,15 @@ kept for diagnostic efficiency comparisons only and is labelled
 `m3_status=limited_materialized_read_control_checkpoint_replay`; it does not
 claim complete query invalidation, NOOP predicate scope, output-stability
 propagation, or full input memoization.
+
+The `m3_mode=recheck` policy restores the materialized invalidation boundary,
+re-executes the current retrieval/control/write code, and reuses only exact
+request-key responses inherited from the paired baseline. It is labelled
+`m3_status=generic_recheck_request_key_cache`; cache hits and misses are
+reported as `llm_cache_hits` and `llm_calls`. This is an explicit strong
+generic baseline for the pilot, but its safety depends on the frozen request
+key, model configuration, and context being part of the request identity. It
+is not claimed to be a complete self-adjusting computation implementation.
 
 All checkpoint arms report restore, prefix, suffix, retrieval, generation,
 embedding, index, validation, and instrumentation costs in the same lifecycle

@@ -171,6 +171,44 @@ def _summary(
         "mask_policy": instance.get("mask_policy"),
         "deleted_source_ids": list(instance["deleted_source_ids"]),
         "arms": arms,
+        "reference_query_probe": query_probes.get("M0_reference_repeat"),
+    }
+
+
+def _canonical_evidence_payload(evidence: Any, details: dict[str, Any]) -> dict[str, Any]:
+    """Build a UUID-invariant delivery signature for query evidence.
+
+    Physical note IDs, audit IDs, timing and cost counters describe one run,
+    not the delivered logical evidence. The signature keeps source-level
+    evidence and stable retrieval semantics. Completeness and ambiguity remain
+    explicit fields instead of being hidden by normalization.
+    """
+
+    stable_detail_keys = (
+        "raw_context_hash",
+        "raw_context_chars",
+        "context_source_ids",
+        "context_coverage",
+        "context_coverage_ratio",
+        "lineage_coverage",
+        "context_mapping_complete",
+        "retrieval_score_coverage",
+        "scores_available",
+        "unmapped_context_hash",
+        "evidence_complete",
+        "answer_retrieval_is_best_effort",
+    )
+    stable_details: dict[str, Any] = {}
+    for key in stable_detail_keys:
+        value = details.get(key)
+        if key.endswith("_ids") and isinstance(value, (list, tuple, set)):
+            stable_details[key] = sorted({str(item) for item in value})
+        elif value is not None:
+            stable_details[key] = value
+    return {
+        "source_ids": sorted({str(item) for item in getattr(evidence, "source_ids", [])}),
+        "read_set": sorted({str(item) for item in getattr(evidence, "read_set", [])}),
+        "details": stable_details,
     }
 
 
@@ -224,11 +262,38 @@ def _probe_query(
     details = dict(evidence.details)
     source_ids = sorted(set(evidence.source_ids) | set(evidence.read_set))
     deleted_exposed = bool(deleted.intersection(source_ids))
-    evidence_payload = evidence.model_dump(mode="json") if hasattr(evidence, "model_dump") else {
-        "source_ids": list(evidence.source_ids),
-        "read_set": list(evidence.read_set),
-        "details": details,
-    }
+    try:
+        evidence_payload = _canonical_evidence_payload(evidence, details)
+    except NameError:
+        # The independent audit loader executes only this function body. Keep
+        # the contract self-contained for that path without weakening the
+        # production helper above.
+        stable_detail_keys = (
+            "raw_context_hash",
+            "raw_context_chars",
+            "context_source_ids",
+            "context_coverage",
+            "context_coverage_ratio",
+            "lineage_coverage",
+            "context_mapping_complete",
+            "retrieval_score_coverage",
+            "scores_available",
+            "unmapped_context_hash",
+            "evidence_complete",
+            "answer_retrieval_is_best_effort",
+        )
+        stable_details = {}
+        for key in stable_detail_keys:
+            value = details.get(key)
+            if key.endswith("_ids") and isinstance(value, (list, tuple, set)):
+                stable_details[key] = sorted({str(item) for item in value})
+            elif value is not None:
+                stable_details[key] = value
+        evidence_payload = {
+            "source_ids": sorted({str(item) for item in evidence.source_ids}),
+            "read_set": sorted({str(item) for item in evidence.read_set}),
+            "details": stable_details,
+        }
     record = {
         "question_id": question_id,
         "question_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
@@ -236,6 +301,7 @@ def _probe_query(
         "evidence_sha256": hashlib.sha256(
             json.dumps(evidence_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest(),
+        "evidence_signature": evidence_payload,
         "source_ids": source_ids,
         "read_set": sorted(set(evidence.read_set)),
         "candidate_ids": list(details.get("candidate_ids", [])),
@@ -281,7 +347,7 @@ def main() -> int:
     parser.add_argument("--retrieve-k", type=int, default=10)
     parser.add_argument(
         "--m3-mode",
-        choices=("materialized", "conservative_full"),
+        choices=("materialized", "recheck", "conservative_full"),
         default="conservative_full",
         help="M3 dependency policy; conservative_full is the correctness baseline.",
     )
@@ -438,10 +504,58 @@ def main() -> int:
                 "query_cost_observed": all(record["query_cost_observed"] for record in records),
                 "query_isolated": all(record["query_isolated"] for record in records),
             }
+        # Probe the independent M0 repeat as a separate reference. This avoids
+        # making the M0 reference self-certifying when checking post-maintenance
+        # continuation. The extra work is recorded in the lifecycle ledger.
+        reference_repeat_wrapper = getattr(
+            outputs[MaintenanceArm.M0_FULL_REBUILD][0],
+            "reference_repeat_wrapper",
+            None,
+        )
+        if reference_repeat_wrapper is not None:
+            repeat_records: list[dict[str, Any]] = []
+            for item in query_items:
+                record, counters, elapsed_ms = _probe_query(
+                    SimpleNamespace(wrapper=reference_repeat_wrapper),
+                    arm=MaintenanceArm.M0_FULL_REBUILD,
+                    question=item["question"],
+                    question_id=item["question_id"],
+                    deleted=deleted,
+                    trace=trace,
+                )
+                record["reference_repeat"] = True
+                repeat_records.append(record)
+                cost.record(
+                    "query_probe",
+                    scope="query_probe",
+                    duration_ms=elapsed_ms,
+                    counters=counters,
+                    arm="M0_reference_repeat",
+                    query_id=item["question_id"],
+                    query_sha256=record["question_sha256"],
+                    deleted_source_exposed=record["deleted_source_exposed"],
+                    evidence_complete=record["evidence_complete"],
+                    query_cost_observed=record["query_cost_observed"],
+                    query_isolated=record["query_isolated"],
+                )
+            query_probes["M0_reference_repeat"] = {
+                "query_policy": "independent_m0_repeat",
+                "query_count_requested": len(query_items),
+                "records": repeat_records,
+                "evidence_complete": all(record["evidence_complete"] for record in repeat_records),
+                "deleted_source_exposed": any(record["deleted_source_exposed"] for record in repeat_records),
+                "query_cost_observed": all(record["query_cost_observed"] for record in repeat_records),
+                "query_isolated": all(record["query_isolated"] for record in repeat_records),
+            }
         # Continuation is a separate oracle from the pre-query visible state.
-        # Compare the same question IDs against the independent M0 probe only
-        # when both probes were isolated and evidence was observed.
-        m0_records = query_probes[MaintenanceArm.M0_FULL_REBUILD.value]["records"]
+        # Prefer an independent M0-repeat query when the builder exposes one;
+        # fall back to the M0 reference only for legacy fixtures.
+        m0_records = (
+            query_probes["M0_reference_repeat"]["records"]
+            if isinstance(query_probes.get("M0_reference_repeat"), dict)
+            and isinstance(query_probes["M0_reference_repeat"].get("records"), list)
+            else query_probes[MaintenanceArm.M0_FULL_REBUILD.value]["records"]
+        )
         m0_by_id = {record["question_id"]: record for record in m0_records}
         for arm_name, probe_group in query_probes.items():
             checks: list[bool] = []
@@ -451,6 +565,8 @@ def main() -> int:
                     reference_record
                     and record.get("query_isolated")
                     and reference_record.get("query_isolated")
+                    and record.get("evidence_complete")
+                    and reference_record.get("evidence_complete")
                     and record.get("answer_sha256") == reference_record.get("answer_sha256")
                     and record.get("evidence_sha256") == reference_record.get("evidence_sha256")
                     and not record.get("deleted_source_exposed")

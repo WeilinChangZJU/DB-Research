@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from bemula.baselines.base import MemoryAdapter
+from bemula.baselines.amem import AmemAdapter
 from bemula.research import (
     AmemBackend,
     AmemResearchWrapper,
@@ -235,6 +236,24 @@ def test_amem_m3_conservative_full_mode_is_explicit_and_separate_from_materializ
     assert limited_result.metadata["m3_status"] == "limited_materialized_read_control_checkpoint_replay"
 
 
+def test_amem_m3_recheck_is_explicit_generic_reuse_baseline():
+    events = [
+        SourceEvent("e0", "src-a", "alpha", timestamp="t0"),
+        SourceEvent("e1", "src-b", "beta", timestamp="t1"),
+        SourceEvent("e2", "src-c", "gamma", timestamp="t2"),
+    ]
+    result = run_amem_all_arms(
+        events,
+        ["src-a"],
+        _ScriptedAmemAdapter,
+        m3_mode="recheck",
+    )[MaintenanceArm.M3_READ_SET][0]
+    assert result.metadata["m3_mode"] == "recheck"
+    assert result.metadata["replay_mode"] == "generic_recheck_safe_reuse"
+    assert result.metadata["m3_status"] == "generic_recheck_request_key_cache"
+    assert result.metadata["dependency_baseline"] == "generic_recheck_request_key_cache"
+
+
 def test_amem_canonical_snapshot_ignores_physical_note_ids():
     def build_state():
         backend = AmemResearchWrapper(_StubAmemAdapter(), retrieve_k=2)
@@ -381,6 +400,51 @@ def test_amem_canonical_checkpoint_round_trip(tmp_path):
     entry = backend.save_checkpoint(store, state_id="amem-state-0", dataset="fixture", instance_id="i0")
     restored = AmemResearchWrapper.load_checkpoint(store, entry["state_id"])
     assert restored.canonical_hash == backend.canonical_snapshot(dataset="fixture", instance_id="i0").canonical_hash
+
+
+def test_official_amem_fork_rebinds_retriever_embedder_and_consolidation_closure():
+    class _FakeSystem:
+        pass
+
+    class _FakeRetriever:
+        pass
+
+    class _CountingEmbedder:
+        def __init__(self):
+            self.calls = 0
+            self.items = 0
+
+        def embed(self, texts):
+            self.calls += 1
+            self.items += len(texts)
+            return np.zeros((len(texts), 2), dtype=np.float32)
+
+    source_embedder = _CountingEmbedder()
+    adapter = AmemAdapter.__new__(AmemAdapter)
+    adapter.llm = object()
+    adapter.embedder = source_embedder
+    adapter.retrieve_k = 2
+    adapter._system_class = _FakeSystem
+    adapter._retriever_class = _FakeRetriever
+    adapter._progress = SimpleNamespace()
+    adapter.provider_fork_mode = "fresh_provider"
+    adapter._system = adapter._create_system()
+    adapter._system.retriever.corpus = ["source"]
+    adapter._system.retriever.embeddings = np.zeros((1, 2), dtype=np.float32)
+    adapter._system.retriever.document_ids = {"source": 0}
+
+    clone = adapter.fork()
+    assert clone._system.retriever.model._embedder is clone.embedder
+    clone_embedder = _CountingEmbedder()
+    clone.embedder = clone_embedder
+
+    # The consolidation closure must also be bound to the fork, so replacing
+    # its provider cannot silently recreate a retriever from the source.
+    clone._system.consolidate_memories()
+    assert clone._system.retriever.model._embedder is clone_embedder
+    clone._system.retriever.model.encode(["query"])
+    assert clone_embedder.calls == 1
+    assert source_embedder.calls == 0
 
 
 

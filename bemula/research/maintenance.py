@@ -74,6 +74,7 @@ class BuildCost:
     generated_objects: int = 0
     state_records: int = 0
     llm_calls: int = 0
+    llm_cache_hits: int = 0
     # Provider usage is optional.  ``None`` means the boundary did not expose
     # a measurement; it must not be rendered as a measured zero.
     input_tokens: int | None = None

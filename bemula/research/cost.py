@@ -26,6 +26,7 @@ from typing import Any, Iterator, Mapping
 # counters used in reports.
 STANDARD_COUNTERS = (
     "llm_calls",
+    "llm_cache_hits",
     "input_tokens",
     "output_tokens",
     "embedding_calls",
@@ -233,7 +234,7 @@ class CostRecorder:
             "input_events", "replayed_events", "prefix_replayed_events",
             "suffix_replayed_events", "checkpoint_restore_events",
             "checkpoint_restore_bytes", "retrieved_candidates",
-            "generated_objects", "state_records", "llm_calls", "input_tokens",
+            "generated_objects", "state_records", "llm_calls", "llm_cache_hits", "input_tokens",
             "output_tokens", "embedding_calls", "embedding_items",
             "index_updates", "memory_reads", "bytes_read", "bytes_written",
         )

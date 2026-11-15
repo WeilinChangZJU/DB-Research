@@ -155,6 +155,10 @@ class CanonicalArtifact(BaseModel):
     timestamp: str | None = None
     support_set: list[str] = Field(default_factory=list)
     parent_ids: list[str] = Field(default_factory=list)
+    # Ordered retrieval/expansion links. ``parent_ids`` is retained for
+    # backward compatibility; exporters should populate this field whenever
+    # link order can affect the delivered context.
+    retrieval_parent_ids: list[str] = Field(default_factory=list)
     embedding_hash: str | None = None
     relation_ids: list[str] = Field(default_factory=list)
     visible: bool = True
@@ -171,12 +175,13 @@ class CanonicalArtifact(BaseModel):
     def semantic_id(self) -> str:
         if self.canonical_id:
             return self.canonical_id
+        retrieval_links = self.retrieval_parent_ids or self.parent_ids
         return _json_hash(
             {
                 "object_type": self.object_type,
                 "content_hash": self.content_hash,
                 "support_set": sorted(set(self.support_set)),
-                "parent_ids": sorted(set(self.parent_ids)),
+                "parent_ids": list(retrieval_links),
                 "version": self.version,
             }
         )
@@ -310,7 +315,12 @@ class CanonicalState(BaseModel):
                 # as part of the resulting semantic ID rather than recurse.
                 return f"cycle:{object_id}"
             visiting.add(object_id)
-            parent_ids = sorted(resolve(parent_id) for parent_id in artifact.parent_ids)
+            # ``parent_ids`` carries ordered retrieval links in the A-MEM
+            # exporter. Preserve that order because neighbour expansion is
+            # part of the service-visible context. Unordered source support
+            # remains represented separately by ``support_set``.
+            raw_parent_ids = artifact.retrieval_parent_ids or artifact.parent_ids
+            parent_ids = [resolve(parent_id) for parent_id in raw_parent_ids]
             semantic_id = _json_hash(
                 {
                     "object_type": artifact.object_type,
@@ -366,15 +376,22 @@ class CanonicalState(BaseModel):
             return artifact_semantic_ids.get(reference, reference)
 
         artifact_payload = []
-        for artifact in sorted(self.artifacts, key=lambda item: artifact_semantic_ids[item.object_id]):
+        for artifact in self.artifacts:
             data = artifact.model_dump(mode="json")
             data.pop("object_id", None)
             data.pop("relation_ids", None)
             data["semantic_id"] = artifact_semantic_ids[artifact.object_id]
             data["support_set"] = sorted(set(artifact.support_set))
-            data["parent_ids"] = sorted(map_reference(parent_id) for parent_id in artifact.parent_ids)
+            data["parent_ids"] = [map_reference(parent_id) for parent_id in artifact.parent_ids]
+            data["retrieval_parent_ids"] = [
+                map_reference(parent_id)
+                for parent_id in (artifact.retrieval_parent_ids or artifact.parent_ids)
+            ]
             data["metadata"] = clean(artifact.metadata)
             artifact_payload.append(data)
+        # Canonicalize collection order independently of input list order
+        # while retaining each artifact's ordered retrieval links.
+        artifact_payload.sort(key=_json_hash)
 
         relation_payload = []
         for relation in sorted(self.relations, key=lambda item: item.semantic_key):

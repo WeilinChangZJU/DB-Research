@@ -17,11 +17,17 @@ Current research status: the earlier focused real-provider pilot remains
 The current source has since been repaired so that M0 uses an independent
 repeat, M1--M3 share one forkable baseline, M2/M3 use runtime checkpoints
 instead of hidden prefix re-ingestion, and visible/runtime comparison layers
-are reported separately. The formal runner defaults to the explicit
-`m3_mode=conservative_full` checkpoint policy, which replays the complete
-retained history as a conservative correctness baseline. The optional
-`m3_mode=materialized` policy remains a limited diagnostic baseline; no
-general exact-dependency or superiority claim is made. The latest bounded real-model pilot review is in [docs/Q01_PILOT_REVIEW_20261115.md](docs/Q01_PILOT_REVIEW_20261115.md).
+are reported separately. Canonical identity preserves source/time/origin
+distinctions and ordered retrieval links; physical UUIDs are excluded from
+query evidence signatures. The formal runner defaults to
+`m3_mode=conservative_full`, which replays the complete retained history as a
+conservative correctness baseline. `m3_mode=materialized` is a limited
+diagnostic policy, while `m3_mode=recheck` is a generic re-evaluation policy
+with exact request-key response reuse. Neither mode is presented as a proven
+optimal dependency algorithm. The latest bounded real-model pilot review is in
+[docs/Q01_PILOT_REVIEW_20261115.md](docs/Q01_PILOT_REVIEW_20261115.md), and
+third-audit repairs are recorded in
+[docs/Q01_THIRD_AUDIT_REPAIR_20261115.md](docs/Q01_THIRD_AUDIT_REPAIR_20261115.md).
 
 ## Setup
 

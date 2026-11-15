@@ -16,10 +16,8 @@ import os
 from typing import Any
 
 import numpy as np
-from dotenv import load_dotenv
-
 from bemula.baselines.base import MemoryAdapter
-from bemula.llm import BaseLLM, resolve_embed_endpoint
+from bemula.llm import BaseLLM, load_environment_once, resolve_embed_endpoint
 from bemula.schemas import Turn
 
 
@@ -34,7 +32,7 @@ class OpenAIEmbedder:
     def __init__(self, model: str | None = None) -> None:
         from openai import OpenAI
 
-        load_dotenv(override=True)
+        load_environment_once()
         self.model = model or os.environ.get("BEMULA_EMBED_MODEL", "text-embedding-3-small")
         base_url, api_key = resolve_embed_endpoint(self.model)
         self._client = OpenAI(base_url=base_url, api_key=api_key)
@@ -53,7 +51,7 @@ class LocalEmbedder:
     """
 
     def __init__(self, model: str | None = None) -> None:
-        load_dotenv(override=True)
+        load_environment_once()
         self.model = model or os.environ.get(
             "BEMULA_HF_EMBED_MODEL", "all-MiniLM-L6-v2"
         )
@@ -83,7 +81,7 @@ class LocalEmbedder:
 def get_embedder() -> OpenAIEmbedder | LocalEmbedder:
     """Factory: the embedding backend is chosen by BEMULA_EMBED_BACKEND
     ("api" default, "local" for a local sentence-transformers model)."""
-    load_dotenv(override=True)
+    load_environment_once()
     backend = os.environ.get("BEMULA_EMBED_BACKEND", "api").strip().lower()
     if backend == "api":
         return OpenAIEmbedder()
