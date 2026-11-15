@@ -231,6 +231,11 @@ def main() -> int:
     args.out_root.mkdir(parents=True, exist_ok=True)
     child_env = dict(os.environ)
     child_env["BEMULA_SOURCE_ROOT"] = str(Path(__file__).resolve().parents[1])
+    # Pass the exact checkout that was hash/commit-verified above.  Without
+    # this explicit propagation, AmemAdapter would fall back to a sibling
+    # directory and the child runner could execute a different source tree
+    # than the one used for freeze validation.
+    child_env["BEMULA_AMEM_PATH"] = str(amem_path)
     official = freeze["official_amem"]
     child_env["BEMULA_FREEZE_SHA256"] = _sha256(freeze_path)
     child_env["BEMULA_AMEM_COMMIT"] = str(
