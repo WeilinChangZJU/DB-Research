@@ -148,7 +148,7 @@ PYTHONPATH=. uv run python scripts/run_q01_amem_formal.py \
   --out-root ../q01_runs/formal_real_focused_window \
   --review-out ../q01_freeze/formal_real_focused_window_review.json \
   --agent-model deepseek-flash \
-  --retrieve-k 10 \
+  --retrieve-k 5 \
   --query-limit 1 \
   --evidence-level real_model_focused_window \
   --resume
@@ -159,6 +159,12 @@ Before retrying a run that stopped with `formal_run_blocker.json` status
 explicitly. The interrupted history may have paid requests without a committed
 instance checkpoint, so the runner refuses an implicit replay; a successful
 end-to-end review removes the active blocker receipt.
+
+The wrapper records provider exceptions separately from model decisions. The
+official A-MEM implementation can catch an upstream 401/402/429 and store an
+unevolved note; the Q01 wrapper now refuses that fallback after the operation
+and the formal run must be treated as blocked. Do not interpret a stderr-only
+partial trace as a completed history or as a zero-cost/zero-exposure result.
 
 The command is intentionally serial. Each paired history executes two
 independent M0 rebuilds (the second is a repeatability check) and one common

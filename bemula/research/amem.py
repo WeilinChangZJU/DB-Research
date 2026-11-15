@@ -126,10 +126,19 @@ class AmemResearchWrapper(MemoryBackend):
         self._events: list[ProvenanceEvent] = []
         self._step = 0
         self._llm_trace: list[dict[str, Any]] = []
+        # The official A-MEM implementation catches provider exceptions and
+        # stores an unevolved note.  That fallback is unsafe for a formal
+        # experiment: a 401/429 or transport failure would silently become a
+        # different memory state.  Keep an internal error ledger so the
+        # wrapper can fail the operation after the upstream catch boundary.
+        self._provider_errors: list[dict[str, str]] = []
         self._query_records: list[CanonicalQuery] = []
         self._logical_ids: dict[str, str] = {}
         # Stable creation identity is derived from the external source event
-        # and output slot, never from a physical note/storage identifier.
+        # and a semantic output key, never from a physical note/storage
+        # identifier.  The semantic key is deliberately used instead of a
+        # physical-ID tie-break: independent M0 rebuilds can allocate the
+        # same-content outputs in a different UUID order.
         self._logical_origins: dict[str, str] = {}
         # Request-keyed provider responses are copied with a runtime fork.
         # Recheck policies may reuse an unchanged response, but always execute
@@ -183,6 +192,7 @@ class AmemResearchWrapper(MemoryBackend):
         clone._events = copy.deepcopy(self._events)
         clone._step = self._step
         clone._llm_trace = copy.deepcopy(self._llm_trace)
+        clone._provider_errors = copy.deepcopy(self._provider_errors)
         clone._query_records = copy.deepcopy(self._query_records)
         clone._logical_ids = copy.deepcopy(self._logical_ids)
         clone._logical_origins = copy.deepcopy(self._logical_origins)
@@ -222,6 +232,14 @@ class AmemResearchWrapper(MemoryBackend):
 
     def _system(self) -> Any:
         return getattr(self.adapter, "_system", self.adapter)
+
+    def _raise_if_provider_errors(self, phase: str) -> None:
+        if not self._provider_errors:
+            return
+        count = len(self._provider_errors)
+        raise RuntimeError(
+            f"provider call failed during {phase}; refusing upstream fallback ({count} error(s))"
+        )
 
     def _memories(self) -> dict[str, Any]:
         system = self._system()
@@ -469,7 +487,13 @@ class AmemResearchWrapper(MemoryBackend):
                 response = self._response_cache[cache_key]
                 usage = {}
             else:
-                response = completion(prompt, *args, temperature=temperature, **kwargs)
+                try:
+                    response = completion(prompt, *args, temperature=temperature, **kwargs)
+                except Exception as exc:
+                    self._provider_errors.append(
+                        {"call_kind": call_kind, "error_type": type(exc).__name__}
+                    )
+                    raise
                 response = str(response)
                 self._response_cache[cache_key] = response
                 usage = dict(getattr(llm, "last_usage", {}) or {})
@@ -509,7 +533,13 @@ class AmemResearchWrapper(MemoryBackend):
                 response = self._response_cache[cache_key]
                 usage = {}
             else:
-                response = adapter_chat(messages, *args, **kwargs)
+                try:
+                    response = adapter_chat(messages, *args, **kwargs)
+                except Exception as exc:
+                    self._provider_errors.append(
+                        {"call_kind": call_kind, "error_type": type(exc).__name__}
+                    )
+                    raise
                 response = str(response)
                 self._response_cache[cache_key] = response
                 usage = dict(getattr(adapter_llm, "last_usage", {}) or {})
@@ -925,14 +955,23 @@ class AmemResearchWrapper(MemoryBackend):
 
         with self._llm_hook() as llm_calls:
             run_observe()
+        self._raise_if_provider_errors("observe")
         index_after = self._index_summary(system)
         after = self._note_records()
         before_ids, after_ids = set(before), set(after)
-        new_ids = sorted(after_ids - before_ids)
-        changed_ids = sorted(
-            note_id for note_id in before_ids & after_ids
+        new_id_set = after_ids - before_ids
+        changed_id_set = {
+            note_id
+            for note_id in before_ids & after_ids
             if before[note_id].model_dump(mode="json") != after[note_id].model_dump(mode="json")
-        )
+        }
+        # A-MEM's memory mapping preserves creation order, while UUID values
+        # are freshly allocated on every independent rebuild.  Keep the
+        # adapter order for source-to-object lineage and decision traces;
+        # sorting the sets by UUID makes ``SourceProvenance.derived_from``
+        # differ even when both executions produced the same objects.
+        new_ids = [note_id for note_id in after if note_id in new_id_set]
+        changed_ids = [note_id for note_id in after if note_id in changed_id_set]
         object_ids = [item.removeprefix("note:") for item in new_ids + changed_ids]
         # A NOOP is an execution decision and must not fabricate a materialized
         # object by attaching the input to an arbitrary existing note.
@@ -954,11 +993,12 @@ class AmemResearchWrapper(MemoryBackend):
         # source support is known. Deriving identity before this update made
         # same-content notes from different source events collapse to one
         # canonical ID, which in turn hid retargeted links.
-        # ``new_ids`` is sorted by the physical UUID used by A-MEM.  That
-        # ordering changes across independent rebuilds and used to assign
-        # different logical output slots to otherwise identical notes.  Sort
-        # by semantic record fields before assigning the stable origin; exact
-        # duplicates remain equivalent under the multiset comparator.
+        # ``new_ids`` is sorted by semantic record fields before assigning the
+        # stable origin.  A physical-ID tie-break is intentionally avoided:
+        # UUID order changes across independent rebuilds and can otherwise
+        # assign different logical output slots to identical notes.  Exact
+        # semantic duplicates receive the same origin; the canonical
+        # comparator still preserves their multiplicity as a multiset.
         def logical_output_key(object_id: str) -> tuple[str, ...]:
             record = after.get(object_id)
             if record is None:
@@ -975,13 +1015,30 @@ class AmemResearchWrapper(MemoryBackend):
                 json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str),
             )
 
-        logical_new_ids = sorted(new_ids, key=logical_output_key)
-        for output_slot, object_id in enumerate(logical_new_ids):
+        # Preserve the adapter's creation order for equal semantic keys.  The
+        # order is available from the ordered ``after`` mapping and is stable
+        # for a deterministic execution, while the UUID order of ``new_ids``
+        # is not.  Include an occurrence ordinal so duplicate outputs from a
+        # single source remain distinct without depending on physical IDs.
+        logical_new_ids = sorted(
+            new_ids,
+            key=lambda object_id: (
+                logical_output_key(object_id),
+                tuple(after).index(object_id),
+            ),
+        )
+        occurrence_by_key: dict[str, int] = {}
+        for object_id in logical_new_ids:
             record = after.get(object_id)
             if record is not None:
+                semantic_output_key = _hash_text(
+                    json.dumps(logical_output_key(object_id), ensure_ascii=False)
+                )[:24]
+                occurrence = occurrence_by_key.get(semantic_output_key, 0)
+                occurrence_by_key[semantic_output_key] = occurrence + 1
                 self._logical_origins.setdefault(
-                    object_id,
-                    f"source:{sid}:output:{output_slot}",
+                    object_id.removeprefix("note:"),
+                    f"source:{sid}:output:{semantic_output_key}:{occurrence}",
                 )
                 self._ensure_logical_id(object_id.removeprefix("note:"), record)
         if captured_candidates:
@@ -1063,6 +1120,7 @@ class AmemResearchWrapper(MemoryBackend):
     def query(self, question: str) -> QueryResult:
         with self._llm_hook() as llm_calls:
             answer, candidate_ids, selected_ids, retrieval_details = self._retrieval_hook(question, self.adapter.query)
+        self._raise_if_provider_errors("query")
         support_ids = sorted({
             source_id
             for note_id in selected_ids

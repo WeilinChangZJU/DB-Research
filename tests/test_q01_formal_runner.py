@@ -107,3 +107,6 @@ def test_resume_after_external_blocker_clears_receipt_after_success(monkeypatch,
     assert formal.main() == 0
     assert len(calls) == 3  # two workload children and the final reviewer
     assert not blocker_path.exists()
+    source_root = str(Path(formal.__file__).resolve().parents[1])
+    for _command, kwargs in calls[:2]:
+        assert source_root in kwargs["env"]["PYTHONPATH"]

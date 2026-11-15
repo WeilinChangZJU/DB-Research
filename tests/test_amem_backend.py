@@ -117,6 +117,30 @@ class _QueryUsageAmemAdapter(_StubAmemAdapter):
         return self.llm.chat([{"role": "user", "content": question}], temperature=0.0)
 
 
+class _SwallowingProviderErrorAdapter(_StubAmemAdapter):
+    class _LLM:
+        def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+            raise RuntimeError("provider authentication failure")
+
+    def reset(self):
+        super().reset()
+        self._system.llm_controller = SimpleNamespace(llm=self._LLM())
+
+    def observe(self, turn: Turn) -> None:
+        try:
+            self._system.llm_controller.llm.get_completion("EVOLUTION DECISION")
+        except Exception:
+            # Mirrors the official A-MEM fallback that stores an unevolved
+            # note after swallowing a provider exception.
+            self._system.add_note(turn.text, time=turn.timestamp)
+
+
+def test_provider_errors_cannot_be_certified_as_unevolved_notes():
+    backend = AmemResearchWrapper(_SwallowingProviderErrorAdapter())
+    with pytest.raises(RuntimeError, match="refusing upstream fallback"):
+        backend.observe(Turn(speaker="user", text="private fact", timestamp="t0"), source_id="src-a")
+
+
 def test_amem_backend_captures_snapshot_provenance_and_best_effort_evidence():
     backend = AmemBackend(_StubAmemAdapter(), retrieve_k=2)
     backend.observe(Turn(speaker="user", text="approval limit is ten thousand", timestamp="t0"), source_id="src-a")

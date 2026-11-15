@@ -327,7 +327,18 @@ def main() -> int:
 
     args.out_root.mkdir(parents=True, exist_ok=True)
     child_env = dict(os.environ)
-    child_env["BEMULA_SOURCE_ROOT"] = str(Path(__file__).resolve().parents[1])
+    source_root = str(Path(__file__).resolve().parents[1])
+    child_env["BEMULA_SOURCE_ROOT"] = source_root
+    # The child is launched from an absolute script path, so Python sets
+    # ``sys.path[0]`` to ``scripts/`` rather than the repository root.  Pass
+    # the verified source root explicitly or the paired runner cannot import
+    # ``bemula`` when formal is invoked from another working directory.
+    existing_pythonpath = child_env.get("PYTHONPATH")
+    child_env["PYTHONPATH"] = (
+        source_root
+        if not existing_pythonpath
+        else os.pathsep.join((source_root, existing_pythonpath))
+    )
     # Pass the exact checkout that was hash/commit-verified above.  Without
     # this explicit propagation, AmemAdapter would fall back to a sibling
     # directory and the child runner could execute a different source tree

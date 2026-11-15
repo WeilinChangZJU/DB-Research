@@ -30,8 +30,10 @@ optimal dependency algorithm. The latest bounded real-model pilot review is in
 [docs/Q01_PILOT_REVIEW_20261115.md](docs/Q01_PILOT_REVIEW_20261115.md), and
 third-audit repairs are recorded in
 [docs/Q01_THIRD_AUDIT_REPAIR_20261115.md](docs/Q01_THIRD_AUDIT_REPAIR_20261115.md).
-The current M0 repeat, lineage repair, controlled verification, and blocked
-real-provider pilot are recorded in
+The current real-model receipt, full-cost review, source-lineage diagnosis,
+provider-authentication blocker, and Q01 decision are recorded in
+[docs/Q01_REAL_PILOT_REVIEW_20261115_V2.md](docs/Q01_REAL_PILOT_REVIEW_20261115_V2.md).
+The preceding repair and controlled verification record remains in
 [docs/Q01_REPEAT_LINEAGE_REPAIR_20261115.md](docs/Q01_REPEAT_LINEAGE_REPAIR_20261115.md).
 
 ## Setup
