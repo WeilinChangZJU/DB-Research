@@ -39,6 +39,11 @@ PYTHONPATH=report/platform python -m pytest -q -p no:cacheprovider report/platfo
 
 第四轮修复本身不等于真实研究结论。当前 Windows 环境没有可验证的 provider credential；WSL 另有历史 .env，但此前同类 post-fix 尝试收到 401，不能把配置文件存在当作可用凭据。因而本轮没有再次消耗 DeepSeek API，也没有把旧的 v1 real receipt 与当前 source 混合。
 
+当前源码下的 formal preflight 已显式写出
+`_q01_external/round4_real_preflight2/formal_run_blocker.json`：冻结的
+DeepSeek endpoint 已对齐，但 `OPENAI_API_KEY` 未配置，因此没有启动任何真实
+model call。这个 blocker 是环境状态证据，不是维护策略结果。
+
 真实 scientific gate 仍要求：同一 freeze、当前 source tree、两个 workload 各至少 1 条 history、M0 cassette/repeat visible equality、完整 final-context lineage、continuation 检查和全生命周期成本均通过。旧 v1 receipt 仍只是修复前 UUID/source-lineage 问题下的真实成本诊断；v2 的 401 partial 仍排除。
 
 因此 Q01 当前结论保持：
