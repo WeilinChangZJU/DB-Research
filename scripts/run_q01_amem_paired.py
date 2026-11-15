@@ -112,6 +112,21 @@ def _load_histories(path: Path) -> list[dict[str, Any]]:
     return list(_iter_histories(path))
 
 
+def _validate_histories(path: Path, limit: int | None = None) -> int:
+    """Validate the selected JSONL prefix before constructing a provider.
+
+    The paired runner streams rows during execution.  A separate validation
+    pass prevents a malformed later row from surfacing only after earlier
+    histories have already incurred model cost.  It keeps the full workload
+    out of memory and returns the number of rows that will be executed.
+    """
+
+    stream = _iter_histories(path)
+    if limit is not None:
+        stream = islice(stream, limit)
+    return sum(1 for _ in stream)
+
+
 def _summary(
     instance: dict[str, Any],
     outputs: dict[Any, tuple[Any, Any]],
@@ -289,6 +304,7 @@ def main() -> int:
     if args.query_limit < 1:
         raise SystemExit("--query-limit must be >= 1")
     args.out.mkdir(parents=True, exist_ok=True)
+    _validate_histories(args.histories, args.limit)
     history_stream = _iter_histories(args.histories)
     if args.limit is not None:
         history_stream = islice(history_stream, args.limit)

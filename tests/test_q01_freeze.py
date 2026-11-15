@@ -3,7 +3,7 @@ import json
 
 from bemula.research.manifest import sha256_tree
 from scripts.build_q01_amem_freeze import build_freeze
-from scripts.run_q01_amem_paired import _load_histories
+from scripts.run_q01_amem_paired import _load_histories, _validate_histories
 from scripts.run_q01_amem_formal import _resolve_amem_path, _source_tree_files_only, _verify_freeze
 
 
@@ -57,6 +57,20 @@ def test_serial_history_loader_rejects_empty_and_duplicate_event_streams(tmp_pat
         assert "duplicate event IDs" in str(exc)
     else:
         raise AssertionError("duplicate event IDs should be rejected")
+
+    valid = tmp_path / "valid.jsonl"
+    valid.write_text(
+        json.dumps(
+            {
+                "instance_id": "h2",
+                "events": [{"event_id": "e0", "source_id": "s0", "content": "a"}],
+                "deleted_source_ids": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _validate_histories(valid) == 1
 
 
 def test_freeze_builder_records_commit_and_input_hashes(tmp_path: Path, monkeypatch):
