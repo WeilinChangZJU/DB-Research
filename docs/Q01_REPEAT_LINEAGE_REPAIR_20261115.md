@@ -51,6 +51,24 @@ LongMemEval-S 各 1 个 history，串行 M0--M3、`retrieve_k=5`、
 checkpoint 路径在确定性机制环境中闭合；controlled 结果不代表真实模型
 质量或自然发生率。
 
+### 受控多历史复核（无 API）
+
+在本阶段收口时又从 pinned official A-MEM commit 重新执行了两组串行
+controlled run。每组包含 2 个独立 source-level history，`retrieve_k=5`、
+`m3_mode=recheck`，使用本地 scripted LLM 和 hash embedder；这些 rows 只用于
+验证多历史隔离、checkpoint、状态比较和 lineage，不是 LoCoMo 或
+LongMemEval-S 原始数据集的真实模型结果。
+
+| controlled workload label | histories | M0 repeat | M1 exact | M2 exact | M3 exact | final-context complete | deleted-source exposure |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| LoCoMo-shaped | 2 | 2/2 | 0/2（弱 tombstone 预期差异） | 2/2 | 2/2 | 8/8 | 0
+| LongMemEval-S-shaped | 2 | 2/2 | 0/2（弱 tombstone 预期差异） | 2/2 | 2/2 | 8/8 | 0
+
+两组 controlled run 的每个 history 都完成了四个 arm 的隔离 query probe；
+`context_segments_complete` 全部为 true，且读取来源集合没有命中删除来源。
+这进一步验证了修复后的串行多历史执行路径，但由于使用 scripted model，
+不能替代真实数据集、真实 provider 或自然发生率证据。
+
 ## real-provider pilot 复核
 
 本阶段使用相同的冻结 A-MEM commit
