@@ -209,7 +209,7 @@ def main() -> int:
     amem_path = _resolve_amem_path(freeze_path)
     blocker_path = args.out_root / "formal_run_blocker.json"
     try:
-        _verify_freeze(
+        freeze = _verify_freeze(
             freeze_path,
             agent_model=args.agent_model,
             embedding_backend=args.embedding_backend,
