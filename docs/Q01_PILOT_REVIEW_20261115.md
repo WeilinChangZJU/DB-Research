@@ -60,6 +60,7 @@
 | query probes | 6.5 s | 8 | 56,492 | 95 | — | score matrix 39,936 values |
 
 按 arm 的维护执行：M1 为 0.43 s、0 次 LLM 调用；M2 为 60.0 s、46 次调用、14 次 replay；M3 为 115.3 s、94 次调用、30 次 replay。embedding calls/items 在本轮汇总中为 unknown，后续必须单独补齐或明确不纳入成本声明。
+LiteLLM 的远端 provider cost map 在运行时超时并回退到本地映射；因此本轮报告 token、调用、时间、读写、checkpoint 和插桩成本，不报告未经独立账单核对的货币金额。
 
 ## 状态与来源证据
 
