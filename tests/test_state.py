@@ -125,6 +125,18 @@ def test_state_hashes_separate_visible_runtime_and_audit_layers():
     assert left.audit_trace_hash != right.audit_trace_hash
 
 
+def test_comparator_reports_visible_and_runtime_layers_separately():
+    left = _state()
+    right = _state()
+    right.metadata["runtime"] = {"queue_size": 1}
+    default_result = CanonicalStateComparator().compare(left, right)
+    strict_result = CanonicalStateComparator(include_runtime=True).compare(left, right)
+    assert default_result.visible_equivalent is True
+    assert default_result.runtime_equivalent is False
+    assert default_result.equivalent is True
+    assert strict_result.equivalent is False
+
+
 def test_provenance_event_hash_is_ordered_and_serializable():
     event = ProvenanceEvent(
         event_id="e0",

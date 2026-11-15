@@ -4,8 +4,11 @@ This repository contains the latest source code for the Q01 validation platform.
 
 - **M0**: independent rebuild from `H \ D`; this is the correctness reference.
 - **M1**: live source tombstone/filter with retriever rebuild and no repair.
-- **M2**: conservative suffix replay after the earliest affected step.
-- **M3**: materialized read/control-closure replay baseline.
+- **M2**: conservative suffix replay from a runtime checkpoint immediately
+  before the earliest deleted source.
+- **M3**: materialized read/control-closure checkpoint baseline. It is labelled
+  limited until query invalidation, NOOP predicate scope, output-stability
+  propagation, and complete input memoization are implemented.
 
 The repository intentionally does not contain benchmark datasets, API keys, large experiment results, or provider logs. Obtain the datasets separately and keep them outside Git. Never commit `.env`, API keys, raw traces, or generated JSONL histories that contain source text.
 
@@ -126,11 +129,18 @@ PYTHONPATH=. uv run python scripts/run_q01_amem_formal.py \
   --review-out ../q01_freeze/formal_real_focused_window_review.json \
   --agent-model deepseek-flash \
   --retrieve-k 10 \
+  --query-limit 1 \
   --evidence-level real_model_focused_window \
   --resume
 ```
 
-The command is intentionally serial. Each arm receives an isolated adapter; M0 is rebuilt independently, while M1–M3 record their separately executed baseline setup and maintenance costs. Resume is safe only when the run fingerprint matches the input, model, retrieval setting and source tree.
+The command is intentionally serial. Each paired history executes two
+independent M0 rebuilds (the second is a repeatability check) and one common
+baseline build. M1--M3 fork that baseline; they do not re-ingest a retained
+prefix. Checkpoint restore bytes/events, suffix execution, query probes, and
+shared lifecycle components are recorded separately. Resume is safe only when
+the run fingerprint matches the input, model, retrieval setting and source
+tree.
 
 ## 5. Review outputs
 
@@ -146,14 +156,27 @@ cost_summary.json
 manifest.json
 ```
 
+The paired runner defaults to one declared item per history (`--query-limit 1`)
+for cost-bounded pilots. Use a larger explicit value when a workload review
+requires more items; the selected item IDs and count are stored in every row's
+`query_probe` record, so a one-item pilot cannot be confused with a complete
+question evaluation.
+
 The reviewer emits JSON and Markdown. Check all of the following before interpreting a result:
 
 1. Both workloads have the expected number of completed histories.
-2. M0 is exact to its own reference and all mutable-arm setup costs are included in the full totals.
+2. M0 is exact to its independent repeat; shared baseline and repeat costs are
+   present once in lifecycle scopes rather than duplicated into every arm.
 3. `visible_state_hash`/canonical state mismatches are inspected by object and relationship, not reduced to an answer score.
 4. Query probes are evidence-complete and their read/context source sets do not contain the deleted source. A missing evidence mapping is an unknown, not proof of zero exposure.
 5. Query answer-model tokens are present in the query cost scope. Older runs made before the query-chat hook was added have unknown query cost and must not report it as zero.
-6. M2/M3 replay mode and status are read from per-arm metadata. A label alone is not evidence that a general exact dependency baseline has been proved.
+6. Continuation answer/evidence hashes are compared against the isolated M0
+   probe. A failed isolation or incomplete context mapping is an execution
+   limitation, not evidence that the deletion method is wrong or successful.
+7. M2/M3 replay mode, checkpoint restoration, and status are read from
+per-arm metadata. A label alone is not evidence that a general exact
+dependency baseline has been proved; the current M3 status is intentionally
+`limited_materialized_read_control_checkpoint_replay`.
 
 For a focused pilot, the correct scientific interpretation is execution evidence only. It does not estimate natural occurrence rates, establish generality, prove novelty, or justify a superiority claim. Calibrate repeated M0 variability before attributing real-model mismatches to maintenance.
 

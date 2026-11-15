@@ -42,6 +42,8 @@ def _source_events(instance: Any) -> list[dict[str, Any]]:
                 "source_id": record.source_id,
                 "content": record.text,
                 "timestamp": record.timestamp or "",
+                "speaker": getattr(record, "speaker", None) or (record.metadata or {}).get("speaker"),
+                "session_id": getattr(record, "session_id", None) or (record.metadata or {}).get("session_id"),
                 "metadata": {
                     **dict(record.metadata),
                     "dataset": record.dataset,
@@ -53,6 +55,8 @@ def _source_events(instance: Any) -> list[dict[str, Any]]:
                 },
             }
         )
+        events[-1]["metadata"].setdefault("speaker", getattr(record, "speaker", None))
+        events[-1]["metadata"].setdefault("session_id", getattr(record, "metadata", {}).get("session_id"))
     return events
 
 
@@ -88,6 +92,11 @@ def _mask_rows(instance: Any, events: list[dict[str, Any]], masks: Iterable[str]
             "instance_id": f"{base_id}:mask:{mask_name}",
             "base_instance_id": base_id,
             "dataset": str(instance.dataset),
+            "selection": {
+                "mask_policy": mask_name,
+                "selected_source_ids": list(deleted),
+                "source_count": len(events),
+            },
             "mask_policy_version": POLICY_VERSION,
             "mask_kind": mask_name,
             "deleted_source_ids": deleted,

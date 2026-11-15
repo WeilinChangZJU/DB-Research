@@ -19,6 +19,36 @@
 - Next gate: restore a clean baseline test run, then make the P0 contract
   regressions pass without weakening assertions.
 
+### 2026-11-15 — second-audit repair continuation
+
+- The current source snapshot incorporates the second-audit corrections. The
+  paired A-MEM runner now performs two independent M0 reference rebuilds plus
+  one shared full baseline, and the M0 row is compared against the independent
+  repeat rather than against itself. M1--M3 receive isolated forks of the
+  shared runtime; mutable baseline setup is recorded once under
+  `common_baseline` and the repeat under `reference_repeat`.
+- A-MEM M2/M3 use provider/runtime checkpoints and report restore events and
+  serialized checkpoint size separately from suffix execution. Prefix
+  re-ingestion is no longer hidden inside a nominal suffix replay. M3 remains
+  explicitly limited to materialized read/control invalidation and is not
+  advertised as a complete generic dependency baseline.
+- The canonical comparator now exposes `visible_equivalent` and
+  `runtime_equivalent`; physical UUID changes remain invisible while serving
+  timestamps, vector/index summaries, cache values, and continuation state can
+  be audited independently. Missing provider token or embedding counters stay
+  unknown rather than becoming measured zero.
+- Durable traces carry instance/base/scenario/arm/phase context and operation
+  IDs. Query probes prefer an isolated runtime fork, preserve unknown usage,
+  and record isolation status. Source-event histories preserve speaker and
+  session roles. The platform suite passes 83 tests. After updating the two
+  second-round diagnostic assertions to the repaired visible/runtime and
+  checkpoint contracts, the independent audit suite passes 20/20.
+- Research decision remains `PROMISING / UNVERIFIED`. These repairs establish
+  a more trustworthy execution platform; they do not retroactively validate
+  the earlier focused-window results, prove Q01, or support a new-method
+  superiority claim. A complete generic M3 and real-workload rerun remain
+  explicit gates.
+
 ## Append-only updates
 
 ### 2026-11-14 — G0/P0/P1/P2/P3 repair checkpoint

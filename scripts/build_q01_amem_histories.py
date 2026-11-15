@@ -50,11 +50,15 @@ def _history_payload(instance: Any, source_path: Path, source_file_sha256: str, 
             "source_record_hash": record.source_hash,
             "source_file_sha256": source_file_sha256,
         }
+        metadata.setdefault("speaker", getattr(record, "speaker", None))
+        metadata.setdefault("session_id", getattr(record, "metadata", {}).get("session_id"))
         event = {
             "event_id": f"{record.source_id}:event",
             "source_id": record.source_id,
             "content": record.text,
             "timestamp": record.timestamp or "",
+            "speaker": getattr(record, "speaker", None) or (record.metadata or {}).get("speaker"),
+            "session_id": getattr(record, "session_id", None) or (record.metadata or {}).get("session_id"),
             "metadata": metadata,
         }
         event["event_hash"] = _stable_hash(event)
@@ -78,6 +82,12 @@ def _history_payload(instance: Any, source_path: Path, source_file_sha256: str, 
         "schema_version": 1,
         "dataset": str(instance.dataset),
         "instance_id": str(instance.instance_id),
+        "base_instance_id": str(instance.instance_id),
+        "selection": {
+            "mask_policy": policy,
+            "selected_event_ordinals": list(ordinals),
+            "source_count": len(events),
+        },
         "source_path": str(source_path.resolve()),
         "source_file_sha256": source_file_sha256,
         "mask_policy": policy,

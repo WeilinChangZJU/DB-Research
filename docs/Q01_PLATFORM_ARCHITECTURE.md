@@ -84,8 +84,8 @@ CanonicalVisible(M_inc) == CanonicalVisible(M_ref)
 已完成测量基础与离线闭环：manifest、checkpoint、trace、ResearchProtocol、
 MemoryBackend、InMemoryBackend、LoCoMo/LongMemEval-S adapter、canonical
 state、dependency trace、M0–M3 maintenance API、cost vector、toy builder、
-source-level paired runner 和统一回归测试。当前平台套件为 73 项通过，
-独立审计契约为 15 项通过。
+source-level paired runner 和统一回归测试。当前平台套件为 83 项通过，
+第二轮独立审计契约在更新过时诊断断言后为 20 项通过。
 
 LoCoMo 与 LongMemEval-S 已各完成一个无模型 controlled-replay pilot；这
 些 pilot 只验证 source overlay、mask、canonical state 和成本输出，不能
@@ -94,7 +94,7 @@ LoCoMo 与 LongMemEval-S 已各完成一个无模型 controlled-replay pilot；�
 
 ## 当前 paired runner 与成本边界
 
-`scripts/run_q01_amem_paired.py` 是 A-MEM source-event 闭环入口。它读取每行一个独立 history 的 JSONL，要求显式提供 `deleted_source_ids`，在同一 `H,D` 上串行运行 M0--M3，并写出每个 arm 的 canonical hash、状态差异、trace、成本、checkpoint 和运行 fingerprint。串行是第一轮的安全默认值；A-MEM adapter 是可变对象，未完成独占 worker 验证前不启用并发。
+`scripts/run_q01_amem_paired.py` 是 A-MEM source-event 闭环入口。它读取每行一个独立 history 的 JSONL，要求显式提供 `deleted_source_ids`，在同一 `H,D` 上串行运行两次独立 M0、一个共享 baseline 和 M1--M3，并写出每个 arm 的 canonical hash、状态差异、trace、成本、checkpoint 和运行 fingerprint。查询探针默认只选一个声明问题，必须通过 `--query-limit` 显式扩大；串行是第一轮的安全默认值，A-MEM adapter 是可变对象，未完成独占 worker 验证前不启用并发。
 
-M2 的成本包含从最早删除位置开始的前缀重新摄取和后缀执行。M3 使用 materialized read/control closure 选择失效起点，但当前仍是保守的前缀重建加后缀重放；`m3_status` 与 `checkpoint_restored=false` 会在结果中显式记录。保存语义 JSON 不被当作可恢复执行 checkpoint。
+M2 从共享 baseline 的运行时 checkpoint 恢复到最早删除源之前，再执行保留后缀；M3 使用 materialized read/control closure 选择失效起点，再从该 checkpoint 执行后缀。两者都把 `checkpoint_restore_events`、`checkpoint_restore_bytes` 和实际后缀执行单独计入 `maintenance_checkpoint_replay`，不会把保存语义 JSON 冒充可恢复执行状态。M3 当前明确标记为 `limited_materialized_read_control_checkpoint_replay`，尚未覆盖完整查询失效、NOOP 谓词依赖、输出稳定传播和全输入 memoization。
 

@@ -21,9 +21,14 @@ trace quality.
 The trace is explicitly labelled `wrapper_delta`. The stock adapter does not
 expose its parsed branch as a stable public API, so the wrapper's branch labels
 are conservative response parsing rather than a formal causal proof. The
-wrapper has semantic checkpoint save/load; physical A-MEM index rehydration
-still requires a builder-specific restore routine. Native source delete is
-unsupported, so M0--M3 use fresh instances plus replay. The A-MEM M1 arm is
+wrapper supports an in-memory runtime fork and event-boundary checkpoints;
+the A-MEM adapter supplies a provider-specific `fork()` that copies memories,
+retriever state and consolidation counters without re-observing the prefix.
+Checkpoint restore is charged as `checkpoint_restore_events` and
+`checkpoint_restore_bytes`. An adapter that cannot fork fails the checkpoint
+arm explicitly instead of silently falling back to prefix replay. Native
+source delete is unsupported, so M0 remains an independent full rebuild and
+M1--M3 operate on a fork of a shared baseline. The A-MEM M1 arm is
 explicitly a conservative cascade: any materialized note whose observed
 support intersects the deletion mask is removed, including a note with
 surviving secondary support. It is a weak isolation baseline and must not be
@@ -55,11 +60,20 @@ the official A-MEM repository nor a model client. The expected contract is:
 | M2 | replay from the earliest affected event | exact to M0 |
 | M3 | replay from the observed dependency boundary | exact to M0 |
 
-M2 and M3 currently re-ingest their unaffected prefix before executing the
-suffix. That prefix work is included in `maintenance_full_execution` cost and
-`checkpoint_restored=false`; current results do not claim checkpoint-based cost
-savings. M3 is a distinct materialized read/control invalidation baseline, but
-not yet a memoizing self-adjusting execution engine.
+M2 restores the checkpoint immediately before the earliest deleted source and
+replays the retained suffix. M3 restores the checkpoint before the earliest
+materialized read/control-affected step and replays from that boundary. Their
+costs are scoped as `maintenance_checkpoint_replay`; retained-prefix execution
+is zero and restore cost is reported separately. M3 is still a limited
+materialized read/control baseline, not a complete exact read-set/control
+dependency engine: query invalidation, NOOP predicate scope, output-stability
+propagation and full input memoization remain explicit follow-up work. Results
+are labelled `m3_status=limited_materialized_read_control_checkpoint_replay`.
+
+`run_amem_all_arms` also runs two independent M0 rebuilds. The second is a
+repeatability check, while one additional full build is shared as the baseline
+runtime from which M1--M3 fork. Shared baseline and repeat costs are recorded
+once in the lifecycle cost ledger rather than charged repeatedly to each arm.
 
 The result is an engineering contract check. It is not a DeepSeek quality
 result and does not establish an A-MEM paper reproduction.

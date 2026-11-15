@@ -9,6 +9,7 @@ related notes, and retrieves neighboring notes at query time.
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 from pathlib import Path
@@ -197,6 +198,39 @@ class AmemAdapter(MemoryAdapter):
         # the only safe way to guarantee isolated state for each eval variant.
         self._system = self._create_system()
         self._progress.start_variant()
+
+    def fork(self) -> "AmemAdapter":
+        """Clone the live A-MEM runtime without re-observing or re-embedding.
+
+        M1/M2/M3 and isolated query probes use this method.  Replaying the
+        prefix through ``observe`` would change provider cost and would make a
+        checkpoint arm indistinguishable from a full prefix rebuild.  The
+        official system keeps mutable runtime state in ``memories`` and the
+        retriever; a fresh system supplies a new consolidation closure before
+        those state objects are copied.
+        """
+
+        clone = object.__new__(type(self))
+        clone.llm = self.llm
+        clone.embedder = self.embedder
+        clone.retrieve_k = self.retrieve_k
+        try:
+            clone._progress = copy.deepcopy(self._progress)
+        except Exception:
+            # tqdm may hold a live stream handle that is not deepcopyable;
+            # progress reporting is orthogonal to runtime serving state.
+            clone._progress = TurnProgress("A-MEM", enabled=False)
+        clone._system_class = self._system_class
+        clone._retriever_class = self._retriever_class
+        clone._system = self._create_system()
+        source_system = self._system
+        target_system = clone._system
+        target_system.memories = copy.deepcopy(getattr(source_system, "memories", {}))
+        target_system.retriever = copy.deepcopy(getattr(source_system, "retriever", None))
+        target_system.refresh_index = getattr(source_system, "refresh_index", False)
+        target_system.evo_cnt = getattr(source_system, "evo_cnt", 0)
+        target_system.evo_threshold = getattr(source_system, "evo_threshold", 100)
+        return clone
 
     def observe(self, turn: Turn) -> None:
         # Follow the official A-MEM LoCoMo harness: every dialogue turn becomes

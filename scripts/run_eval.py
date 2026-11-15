@@ -31,7 +31,7 @@ from bemula.schemas import DialogueInstance, TestItem, load_jsonl
 
 
 def _build_baseline(name: str, llm: BaseLLM,
-                    embedder_provider: str) -> MemoryAdapter:
+                    embedder_provider: str, retrieve_k: int = 10) -> MemoryAdapter:
     """Baseline registry: map CLI names to adapter factories."""
     if name == "rag":
         from bemula.baselines.rag import RagAdapter, get_embedder
@@ -45,7 +45,7 @@ def _build_baseline(name: str, llm: BaseLLM,
         from bemula.baselines.amem import AmemAdapter
         from bemula.baselines.rag import get_embedder
 
-        return AmemAdapter(llm, embedder=get_embedder())
+        return AmemAdapter(llm, embedder=get_embedder(), retrieve_k=retrieve_k)
     if name == "simplemem":
         from bemula.baselines.rag import get_embedder
         from bemula.baselines.simplemem import SimpleMemAdapter

@@ -9,6 +9,18 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Local benchmark inputs and generated experiment artifacts. Keep these
+# outside the source repository; reproducibility receipts should contain
+# hashes and configuration, not raw datasets or provider traces.
+data/
+results/
+q01_inputs/
+q01_runs/
+q01_freeze/
+experiment_results*/
+logs/
+*.jsonl
+
 # LaTeX build artifacts (source PDFs under figures/ stay tracked)
 *.aux
 *.bbl

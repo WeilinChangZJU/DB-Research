@@ -110,11 +110,14 @@ def main() -> int:
         default=os.environ.get("BEMULA_HF_EMBED_MODEL", os.environ.get("BEMULA_EMBED_MODEL", "text-embedding-3-small")),
     )
     parser.add_argument("--retrieve-k", type=int, default=10)
+    parser.add_argument("--query-limit", type=int, default=1)
     parser.add_argument("--locomo-limit", type=int, default=None)
     parser.add_argument("--longmemeval-limit", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--evidence-level", default="real_model_formal")
     args = parser.parse_args()
+    if args.query_limit < 1:
+        raise SystemExit("--query-limit must be >= 1")
     freeze_path = args.freeze.resolve()
     amem_path = Path(os.environ.get("BEMULA_AMEM_PATH", freeze_path.parents[2] / "_amem_extract" / "A-mem-f9a173dec325d84fcc97e7828775c7b241c33466")).resolve()
     blocker_path = args.out_root / "formal_run_blocker.json"
@@ -157,6 +160,7 @@ def main() -> int:
             "--histories", str(input_path),
             "--out", str(out),
             "--retrieve-k", str(args.retrieve_k),
+            "--query-limit", str(args.query_limit),
             "--agent-model", args.agent_model,
         ]
         if limit is not None:

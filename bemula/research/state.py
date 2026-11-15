@@ -152,6 +152,7 @@ class CanonicalArtifact(BaseModel):
     content_hash: str | None = None
     canonical_id: str | None = None
     version: int = 1
+    timestamp: str | None = None
     support_set: list[str] = Field(default_factory=list)
     parent_ids: list[str] = Field(default_factory=list)
     embedding_hash: str | None = None
@@ -271,6 +272,7 @@ class CanonicalState(BaseModel):
                 content=record.content,
                 content_hash=record.source_hash,
                 version=record.version,
+                timestamp=record.timestamp,
                 support_set=list(record.support_set),
                 parent_ids=list(record.derived_from),
                 visible=True,
@@ -342,6 +344,15 @@ class CanonicalState(BaseModel):
                 return [clean(item) for item in value]
             return value
 
+        def map_value(value: Any, mapper: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {mapper(str(key)): map_value(item, mapper) for key, item in value.items()}
+            if isinstance(value, (list, tuple, set)):
+                return [map_value(item, mapper) for item in value]
+            if isinstance(value, str):
+                return mapper(value)
+            return value
+
         source_payload = []
         for source in sorted(self.sources, key=lambda item: item.source_id):
             data = source.model_dump(mode="json")
@@ -394,7 +405,7 @@ class CanonicalState(BaseModel):
                 for key, value in sorted(query.scores.items(), key=lambda item: str(item[0]))
             }
             data["control_dependencies"] = sorted(map_reference(item) for item in query.control_dependencies)
-            data["metadata"] = clean(query.metadata)
+            data["metadata"] = clean(map_value(query.metadata, map_reference))
             query_payload.append(data)
 
         artifact_ids = {artifact.object_id: artifact.semantic_id for artifact in self.artifacts}
@@ -410,6 +421,7 @@ class CanonicalState(BaseModel):
             data["candidate_ids"] = [map_reference(item) for item in event.candidate_ids]
             data["selected_ids"] = [map_reference(item) for item in event.selected_ids]
             data["control_dependencies"] = [map_reference(item) for item in event.control_dependencies]
+            data["metadata"] = clean(map_value(event.metadata, map_reference))
             event_payload.append(data)
         return {
             "schema_version": self.schema_version,
@@ -484,6 +496,9 @@ class StateMismatch(BaseModel):
 
 class CanonicalStateDiff(BaseModel):
     equivalent: bool
+    visible_equivalent: bool = True
+    runtime_equivalent: bool = True
+    continuation_checks_passed: bool | None = None
     left_hash: str
     right_hash: str
     mismatches: list[StateMismatch] = Field(default_factory=list)
@@ -504,9 +519,11 @@ class CanonicalStateComparator:
         *,
         ignored_metadata_keys: Iterable[str] = (),
         include_provenance: bool = False,
+        include_runtime: bool = False,
     ):
         self.ignored_metadata_keys = frozenset(ignored_metadata_keys)
         self.include_provenance = include_provenance
+        self.include_runtime = include_runtime
 
     def compare(self, left: CanonicalState, right: CanonicalState) -> CanonicalStateDiff:
         mismatches: list[StateMismatch] = []
@@ -534,6 +551,7 @@ class CanonicalStateComparator:
                 grouped.setdefault(str(item.get(key_field)), []).append(item)
             indexed: dict[str, Any] = {}
             for key, values in grouped.items():
+                values = sorted(values, key=_json_hash)
                 for ordinal, value in enumerate(values):
                     indexed[f"{key}#{ordinal}"] = value
             return indexed
@@ -592,8 +610,27 @@ class CanonicalStateComparator:
                     right=right_payload["metadata"],
                 )
             )
+        visible_kinds = {
+            StateMismatchKind.SOURCE,
+            StateMismatchKind.ARTIFACT,
+            StateMismatchKind.RELATION,
+            StateMismatchKind.QUERY,
+            StateMismatchKind.TOMBSTONE,
+        }
+        visible_equivalent = not any(mismatch.kind in visible_kinds for mismatch in mismatches)
+        runtime_equivalent = not any(
+            mismatch.kind is StateMismatchKind.METADATA for mismatch in mismatches
+        )
+        audit_equivalent = not any(
+            mismatch.kind is StateMismatchKind.PROVENANCE for mismatch in mismatches
+        )
+        equivalent = visible_equivalent and (runtime_equivalent if self.include_runtime else True)
+        if self.include_provenance:
+            equivalent = equivalent and audit_equivalent
         return CanonicalStateDiff(
-            equivalent=not mismatches,
+            equivalent=equivalent,
+            visible_equivalent=visible_equivalent,
+            runtime_equivalent=runtime_equivalent,
             left_hash=_json_hash(left_payload),
             right_hash=_json_hash(right_payload),
             mismatches=mismatches,
@@ -606,11 +643,13 @@ def compare_canonical_states(
     *,
     ignored_metadata_keys: Iterable[str] = (),
     include_provenance: bool = False,
+    include_runtime: bool = False,
 ) -> CanonicalStateDiff:
     """Convenience function for one-off canonical state comparisons."""
 
     return CanonicalStateComparator(
         ignored_metadata_keys=ignored_metadata_keys,
         include_provenance=include_provenance,
+        include_runtime=include_runtime,
     ).compare(left, right)
 

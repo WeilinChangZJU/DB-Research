@@ -62,14 +62,31 @@ class DependencyGraph:
         operation_node = f"operation:{operation_id}"
         if operation_node != decision_id:
             self.add(DependencyEdge(operation_node, decision_id, "operation_decision", event.step, event.query_id))
+        current_source_id = str(event.metadata.get("current_source_id", ""))
+        content_support_ids = {
+            str(value) for value in event.metadata.get("content_support_ids", [])
+        }
         for source_id in event.source_ids:
-            self.add(DependencyEdge(source_id, operation_node, "source_operation", event.step, event.query_id))
+            source_text = str(source_id)
+            if source_text in content_support_ids and source_text != current_source_id:
+                edge_kind = "content_support"
+            elif source_text == current_source_id:
+                edge_kind = "input_source"
+            else:
+                edge_kind = "source_operation"
+            self.add(DependencyEdge(source_text, operation_node, edge_kind, event.step, event.query_id))
         for object_id in event.object_ids:
             self.add(DependencyEdge(decision_id, self._normalize_object_id(object_id), "decision_object", event.step, event.query_id))
         for candidate_id in event.candidate_ids:
             self.add(DependencyEdge(self._normalize_object_id(candidate_id), decision_id, "candidate_decision", event.step, event.query_id))
-        for selected_id in event.selected_ids:
-            self.add(DependencyEdge(self._normalize_object_id(selected_id), decision_id, "selected_decision", event.step, event.query_id))
+        # ``selected_ids`` are inputs for read/select/query events, but the
+        # wrapper also uses the field as a compatibility output list on write
+        # and update events.  Treating those outputs as inputs creates an
+        # unversioned decision <-> object cycle and is not an execution DAG.
+        event_kind = event.event_type.value
+        if event_kind not in {"write", "update"}:
+            for selected_id in event.selected_ids:
+                self.add(DependencyEdge(self._normalize_object_id(selected_id), decision_id, "selected_decision", event.step, event.query_id))
         for control_id in event.control_dependencies:
             self.add(DependencyEdge(self._normalize_object_id(control_id), decision_id, "control_dependency", event.step, event.query_id))
 

@@ -166,6 +166,46 @@ def test_amem_wrapper_runs_source_aware_m0_m3_offline():
     assert any(event.event_type.value == "ingest" for event in wrapper.decision_events)
 
 
+def test_amem_paired_arms_share_one_baseline_and_m0_is_independent_repeat():
+    calls = []
+
+    def factory():
+        calls.append(len(calls))
+        return _StubAmemAdapter()
+
+    events = [
+        SourceEvent("e0", "src-a", "alpha", timestamp="t0"),
+        SourceEvent("e1", "src-b", "beta", timestamp="t1"),
+        SourceEvent("e2", "src-c", "gamma", timestamp="t2"),
+    ]
+    results = run_amem_all_arms(events, ["src-c"], factory)
+
+    assert len(calls) == 3  # reference, independent reference repeat, shared baseline
+    m0, m0_cmp = results[MaintenanceArm.M0_FULL_REBUILD]
+    assert m0.metadata["reference_repeat"] is True
+    assert m0.metadata["reference_repeat_equal"] is True
+    assert m0_cmp.equal is True
+    for arm in (MaintenanceArm.M1_TOMBSTONE, MaintenanceArm.M2_REPLAY, MaintenanceArm.M3_READ_SET):
+        assert results[arm][0].metadata["shared_baseline"] is True
+        assert "shared_baseline_cost" in results[arm][0].metadata
+
+
+def test_amem_checkpoint_replay_restores_before_deleted_event_without_prefix_reingest():
+    events = [
+        SourceEvent("e0", "src-a", "alpha", timestamp="t0"),
+        SourceEvent("e1", "src-b", "beta", timestamp="t1"),
+        SourceEvent("e2", "src-c", "gamma", timestamp="t2"),
+    ]
+    results = run_amem_all_arms(events, ["src-c"], _StubAmemAdapter)
+    for arm in (MaintenanceArm.M2_REPLAY, MaintenanceArm.M3_READ_SET):
+        result, comparison = results[arm]
+        assert comparison.equal
+        assert result.metadata["checkpoint_restored"] is True
+        assert result.cost.prefix_replayed_events == 0
+        assert result.cost.checkpoint_restore_events == 1
+        assert result.wrapper.adapter._system.memories
+
+
 def test_amem_canonical_snapshot_ignores_physical_note_ids():
     def build_state():
         backend = AmemResearchWrapper(_StubAmemAdapter(), retrieve_k=2)
@@ -241,7 +281,8 @@ def test_amem_m2_and_m3_record_distinct_invalidation_policies():
     m3 = results[MaintenanceArm.M3_READ_SET][0]
     assert m2.metadata["replay_mode"] == "conservative_suffix"
     assert m3.metadata["replay_mode"] == "read_control_closure"
-    assert m3.metadata["m3_status"].startswith("implemented_materialized")
+    assert m3.metadata["m3_status"].startswith("limited_materialized")
+    assert m3.metadata["checkpoint_restored"] is True
 
 
 def test_amem_paired_runner_can_receive_durable_trace_recorder():
@@ -254,7 +295,7 @@ def test_amem_paired_runner_can_receive_durable_trace_recorder():
     assert any(event.get("event_type") == "ingest" for event in trace.events)
 
 
-def test_amem_replay_cost_counts_prefix_reingest():
+def test_amem_replay_cost_uses_restored_checkpoint_without_prefix_reingest():
     events = [
         SourceEvent("e0", "src-a", "first fact", timestamp="t0"),
         SourceEvent("e1", "src-b", "second fact", timestamp="t1"),
@@ -263,11 +304,15 @@ def test_amem_replay_cost_counts_prefix_reingest():
     results = run_amem_all_arms(events, ["src-c"], _StubAmemAdapter)
     for arm in (MaintenanceArm.M2_REPLAY, MaintenanceArm.M3_READ_SET):
         result = results[arm][0]
-        assert result.cost.replayed_events == 2
-        assert result.cost.prefix_replayed_events == 2
+        # Deleting the final event restores the checkpoint immediately before
+        # it; no retained prefix is re-ingested and the deleted suffix is
+        # skipped.  The restore itself remains an explicit maintenance cost.
+        assert result.cost.replayed_events == 0
+        assert result.cost.prefix_replayed_events == 0
         assert result.cost.suffix_replayed_events == 0
-        assert result.cost.cost_scope == "maintenance_full_execution"
-        assert result.metadata["checkpoint_restored"] is False
+        assert result.cost.cost_scope == "maintenance_checkpoint_replay"
+        assert result.cost.checkpoint_restore_events == 1
+        assert result.metadata["checkpoint_restored"] is True
 
 
 def test_amem_canonical_checkpoint_round_trip(tmp_path):

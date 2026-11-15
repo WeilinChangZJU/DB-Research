@@ -7,6 +7,11 @@ package identified measurement, provenance, protocol, baseline, and runner
 defects. The changes adapt the framework for Q01 validation; they do not claim
 that Q01 is scientifically established.
 
+> Supersession note (2026-11-15): the prefix-replay observations below are
+> historical evidence from the pre-checkpoint implementation. The current
+> source uses runtime checkpoint forks for A-MEM M2/M3, records restore cost
+> separately, and labels M3 as a limited materialized dependency baseline.
+
 ## Completed changes
 
 - Unified A-MEM canonical export for every maintenance arm. M1 now changes the

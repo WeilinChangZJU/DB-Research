@@ -12,10 +12,13 @@ commit, environment variables, external dataset boundary, explicit deletion
 history generation, focused real-model pilot, serial runner, output contract,
 full-cost accounting, and interpretation limits.
 
-Current research status: the focused real-provider pilot completed execution on
-one 32-event window per workload, but Q01 remains `PROMISING / UNVERIFIED`.
-The pilot is evidence that the measurement path runs; it is not a claim of
-general correctness, novelty, or superiority.
+Current research status: the earlier focused real-provider pilot remains
+`PROMISING / UNVERIFIED` and is retained only as bounded execution evidence.
+The current source has since been repaired so that M0 uses an independent
+repeat, M1--M3 share one forkable baseline, M2/M3 use runtime checkpoints
+instead of hidden prefix re-ingestion, and visible/runtime comparison layers
+are reported separately. The materialized-dependency M3 is still explicitly
+limited; no general exact-dependency or superiority claim is made.
 
 ## Setup
 
@@ -205,5 +208,8 @@ clustering, and reports when a scaled source prefix is used. For a source-level
 A-MEM run with explicit deletion masks, use the serial
 `scripts/run_q01_amem_paired.py` runner described in
 [docs/Q01_PLATFORM_ARCHITECTURE.md](docs/Q01_PLATFORM_ARCHITECTURE.md). The
+runner defaults to one declared question item per history (`--query-limit 1`)
+for cost-bounded pilots; selected item IDs and continuation checks are stored
+in each row. Set a larger explicit limit for a question-complete evaluation.
 answer-level `scripts/run_research_eval.py` remains a separate behavior runner
 and is not a substitute for the Q01 M0--M3 matrix.

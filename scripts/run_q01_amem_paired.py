@@ -29,6 +29,7 @@ from bemula.research import (
     CheckpointStore,
     CostRecorder,
     SourceEvent,
+    MaintenanceArm,
     TraceRecorder,
     run_amem_all_arms,
     sha256_file,
@@ -65,6 +66,16 @@ def _iter_histories(path: Path):
                         content=str(raw["content"]),
                         timestamp=str(raw.get("timestamp", "")),
                         metadata=dict(raw.get("metadata", {})),
+                        speaker=(
+                            str(raw["speaker"])
+                            if raw.get("speaker") is not None
+                            else (str(raw.get("metadata", {}).get("speaker")) if raw.get("metadata", {}).get("speaker") is not None else None)
+                        ),
+                        session_id=(
+                            str(raw["session_id"])
+                            if raw.get("session_id") is not None
+                            else (str(raw.get("metadata", {}).get("session_id")) if raw.get("metadata", {}).get("session_id") is not None else None)
+                        ),
                     )
                 )
             deleted = tuple(dict.fromkeys(str(value) for value in item.get("deleted_source_ids", [])))
@@ -74,7 +85,10 @@ def _iter_histories(path: Path):
                 raise ValueError(f"history {item['instance_id']} deletes unknown source IDs: {unknown}")
             yield {
                 "instance_id": item["instance_id"],
+                "base_instance_id": str(item.get("base_instance_id", item["instance_id"])),
                 "dataset": str(item.get("dataset", "q01")),
+                "selection": dict(item.get("selection", {})),
+                "mask_policy": item.get("mask_policy", item.get("mask_policy_version")),
                 "events": events,
                 "deleted_source_ids": deleted,
                 "items": list(item.get("items", [])),
@@ -97,8 +111,16 @@ def _summary(
     arms: dict[str, Any] = {}
     for arm, (result, comparison) in outputs.items():
         canonical = canonical_snapshots[arm.value]
+        query_probe = query_probes.get(arm.value)
         arms[arm.value] = {
             "exact_to_m0": comparison.equal,
+            "visible_equivalent": comparison.visible_equivalent,
+            "runtime_equivalent": comparison.runtime_equivalent,
+            "continuation_checks_passed": (
+                comparison.continuation_checks_passed
+                if comparison.continuation_checks_passed is not None
+                else (query_probe or {}).get("continuation_checks_passed")
+            ),
             "state_hash": canonical.canonical_hash,
             "visible_state_hash": canonical.visible_state_hash,
             "runtime_state_hash": canonical.runtime_state_hash,
@@ -112,15 +134,106 @@ def _summary(
                 "changed_ids": list(comparison.changed_ids),
                 "reason": comparison.reason,
             },
-            "query_probe": query_probes.get(arm.value),
+            "query_probe": query_probe,
         }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "instance_id": instance["instance_id"],
+        "base_instance_id": instance.get("base_instance_id", instance["instance_id"]),
         "dataset": instance["dataset"],
+        "selection": dict(instance.get("selection", {})),
+        "mask_policy": instance.get("mask_policy"),
         "deleted_source_ids": list(instance["deleted_source_ids"]),
         "arms": arms,
     }
+
+
+def _probe_query(
+    result: Any,
+    *,
+    arm: MaintenanceArm,
+    question: str,
+    question_id: str,
+    deleted: set[str],
+    trace: TraceRecorder,
+) -> tuple[dict[str, Any], dict[str, int | float], float]:
+    """Run one post-maintenance query on an isolated runtime fork."""
+
+    probe_wrapper = result.wrapper
+    query_isolated = False
+    try:
+        probe_wrapper = result.wrapper.fork(trace=trace)
+        query_isolated = True
+    except Exception:
+        # Preserve the probe as a diagnostic, but make the missing isolation
+        # explicit in the receipt and never use it as a continuation oracle.
+        probe_wrapper = result.wrapper
+    probe_wrapper.set_trace_context(phase="query_probe", query_id=question_id)
+    before_events = len(probe_wrapper.provenance_events)
+    started = time.perf_counter()
+    probe = probe_wrapper.query(question)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    new_events = probe_wrapper.provenance_events[before_events:]
+    llm_events = [
+        event for event in new_events
+        if getattr(getattr(event, "event_type", None), "value", str(getattr(event, "event_type", ""))) == "llm_call"
+    ]
+
+    def optional_total(field: str) -> int | None:
+        values = [event.metadata.get(field) for event in llm_events]
+        if not values or any(not isinstance(value, (int, float)) for value in values):
+            return None
+        total = sum(values)
+        return int(total)
+
+    input_tokens = optional_total("input_tokens")
+    output_tokens = optional_total("output_tokens")
+    usage_observed = bool(llm_events) and all(
+        bool(event.metadata.get("usage_observed"))
+        and isinstance(event.metadata.get("input_tokens"), (int, float))
+        and isinstance(event.metadata.get("output_tokens"), (int, float))
+        for event in llm_events
+    )
+    evidence = probe.evidence
+    details = dict(evidence.details)
+    source_ids = sorted(set(evidence.source_ids) | set(evidence.read_set))
+    deleted_exposed = bool(deleted.intersection(source_ids))
+    evidence_payload = evidence.model_dump(mode="json") if hasattr(evidence, "model_dump") else {
+        "source_ids": list(evidence.source_ids),
+        "read_set": list(evidence.read_set),
+        "details": details,
+    }
+    record = {
+        "question_id": question_id,
+        "question_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
+        "answer_sha256": hashlib.sha256(str(probe.answer).encode("utf-8")).hexdigest(),
+        "evidence_sha256": hashlib.sha256(
+            json.dumps(evidence_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest(),
+        "source_ids": source_ids,
+        "read_set": sorted(set(evidence.read_set)),
+        "candidate_ids": list(details.get("candidate_ids", [])),
+        "selected_ids": list(details.get("selected_ids", [])),
+        "context_object_ids": list(details.get("read_object_ids", [])),
+        "context_source_ids": list(details.get("context_source_ids", [])),
+        "evidence_complete": bool(details.get("evidence_complete", False)),
+        "deleted_source_exposed": deleted_exposed,
+        "llm_calls": len(llm_events),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "query_cost_observed": usage_observed,
+        "query_isolated": query_isolated,
+    }
+    counters: dict[str, int | float] = {
+        "llm_calls": len(llm_events),
+        "retrieved_items": len(details.get("candidate_ids", [])),
+        "memory_reads": len(evidence.read_set),
+    }
+    if input_tokens is not None:
+        counters["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        counters["output_tokens"] = output_tokens
+    return record, counters, elapsed_ms
 
 
 def main() -> int:
@@ -129,6 +242,12 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--baseline", default="amem")
     parser.add_argument("--retrieve-k", type=int, default=10)
+    parser.add_argument(
+        "--query-limit",
+        type=int,
+        default=1,
+        help="Number of declared items to probe per arm/history (default: 1 for cost-bounded pilots).",
+    )
     parser.add_argument(
         "--agent-model",
         default=os.environ.get("BEMULA_AGENT_MODEL", "deepseek-flash"),
@@ -139,6 +258,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.retrieve_k < 1:
         raise SystemExit("--retrieve-k must be >= 1")
+    if args.query_limit < 1:
+        raise SystemExit("--query-limit must be >= 1")
     args.out.mkdir(parents=True, exist_ok=True)
     history_stream = _iter_histories(args.histories)
     if args.limit is not None:
@@ -152,13 +273,14 @@ def main() -> int:
         "baseline": args.baseline,
         "histories_sha256": sha256_file(args.histories),
         "retrieve_k": args.retrieve_k,
+        "effective_serve_k": args.retrieve_k,
+        "query_limit": args.query_limit,
         "repository_tree_sha256": tree_digest,
         "agent_model": args.agent_model,
         "embed_backend": os.environ.get("BEMULA_EMBED_BACKEND", "api"),
     }
     store.ensure_fingerprint(fingerprint)
     done = store.completed_ids(validate=True) if args.resume else set()
-    agent_llm = get_llm(model=args.agent_model)
     embed_backend = os.environ.get("BEMULA_EMBED_BACKEND", "api").strip().lower()
     embed_provider = {"api": "openai", "local": "huggingface"}.get(embed_backend, embed_backend)
     cost = CostRecorder(args.out / "cost.jsonl")
@@ -171,28 +293,56 @@ def main() -> int:
         instance_id = instance["instance_id"]
         if instance_id in done:
             continue
-        # The factory is called once per arm by run_amem_all_arms, giving every
-        # arm a fresh adapter while keeping this paired run serial.
-        factory = lambda: _build_baseline(args.baseline, agent_llm, embed_provider)
+        # The arm runner builds two independent M0 references plus one shared
+        # baseline, then forks that baseline for M1--M3.  This keeps the paired
+        # history serial and makes the shared setup visible in the lifecycle
+        # cost ledger.
+        factory = lambda: _build_baseline(
+            args.baseline,
+            get_llm(model=args.agent_model),
+            embed_provider,
+            retrieve_k=args.retrieve_k,
+        )
         outputs = run_amem_all_arms(
             instance["events"],
             instance["deleted_source_ids"],
             factory,
             retrieve_k=args.retrieve_k,
             trace=trace,
+            trace_context={
+                "instance_id": instance_id,
+                "base_instance_id": instance.get("base_instance_id", instance_id),
+                "scenario_id": instance_id,
+                "selection": instance.get("selection", {}),
+            },
         )
         deleted = set(instance["deleted_source_ids"])
-        item_questions = [
-            str(item.get("question", ""))
-            for item in instance.get("items", [])
+        query_items = [
+            {
+                "question_id": str(item.get("item_id", f"item:{index}")),
+                "question": str(item.get("question", "")),
+            }
+            for index, item in enumerate(instance.get("items", []))
             if isinstance(item, dict) and str(item.get("question", "")).strip()
         ]
         deleted_events = [event for event in instance["events"] if event.source_id in deleted]
-        question = (
-            item_questions[0]
-            if item_questions
-            else (deleted_events[0].content if deleted_events else instance["events"][0].content)
-        )[:512]
+        if not query_items:
+            query_items = [
+                {
+                    "question_id": "fallback",
+                    "question": (
+                        deleted_events[0].content
+                        if deleted_events else instance["events"][0].content
+                    ),
+                }
+            ]
+        # The default is one declared item to keep a pilot affordable.  The
+        # selected IDs/count are durable so a run cannot be mistaken for an
+        # all-question workload evaluation.
+        query_items = [
+            {**item, "question": str(item["question"])[:512]}
+            for item in query_items[: args.query_limit]
+        ]
         canonical_snapshots = {
             arm.value: result.wrapper.canonical_snapshot(
                 dataset=instance["dataset"], instance_id=instance["instance_id"]
@@ -201,53 +351,65 @@ def main() -> int:
         }
         query_probes: dict[str, dict[str, Any]] = {}
         for arm, (result, _comparison) in outputs.items():
-            before_events = len(result.wrapper.provenance_events)
-            started = time.perf_counter()
-            probe = result.wrapper.query(question)
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            new_events = result.wrapper.provenance_events[before_events:]
-            llm_events = [
-                event for event in new_events
-                if getattr(getattr(event, "event_type", None), "value", str(getattr(event, "event_type", ""))) == "llm_call"
-            ]
-            input_tokens = sum(int(event.metadata.get("input_tokens", 0) or 0) for event in llm_events)
-            output_tokens = sum(int(event.metadata.get("output_tokens", 0) or 0) for event in llm_events)
-            evidence = probe.evidence
-            details = dict(evidence.details)
-            source_ids = sorted(set(evidence.source_ids) | set(evidence.read_set))
-            deleted_exposed = bool(deleted.intersection(source_ids))
+            records: list[dict[str, Any]] = []
+            for item in query_items:
+                record, counters, elapsed_ms = _probe_query(
+                    result,
+                    arm=arm,
+                    question=item["question"],
+                    question_id=item["question_id"],
+                    deleted=deleted,
+                    trace=trace,
+                )
+                records.append(record)
+                cost.record(
+                    "query_probe",
+                    scope="query_probe",
+                    duration_ms=elapsed_ms,
+                    counters=counters,
+                    arm=arm.value,
+                    query_id=item["question_id"],
+                    query_sha256=record["question_sha256"],
+                    deleted_source_exposed=record["deleted_source_exposed"],
+                    evidence_complete=record["evidence_complete"],
+                    query_cost_observed=record["query_cost_observed"],
+                    query_isolated=record["query_isolated"],
+                )
             query_probes[arm.value] = {
-                "question_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
-                "source_ids": source_ids,
-                "read_set": sorted(set(evidence.read_set)),
-                "candidate_ids": list(details.get("candidate_ids", [])),
-                "selected_ids": list(details.get("selected_ids", [])),
-                "context_object_ids": list(details.get("read_object_ids", [])),
-                "context_source_ids": list(details.get("context_source_ids", [])),
-                "evidence_complete": bool(details.get("evidence_complete", False)),
-                "deleted_source_exposed": deleted_exposed,
-                "llm_calls": len(llm_events),
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "query_cost_observed": bool(llm_events),
+                "query_policy": "declared_items_prefix_v1",
+                "query_count_requested": len(query_items),
+                "records": records,
+                "evidence_complete": all(record["evidence_complete"] for record in records),
+                "deleted_source_exposed": any(record["deleted_source_exposed"] for record in records),
+                "query_cost_observed": all(record["query_cost_observed"] for record in records),
+                "query_isolated": all(record["query_isolated"] for record in records),
             }
-            counters: dict[str, int] = {
-                "llm_calls": len(llm_events),
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "retrieved_items": len(details.get("candidate_ids", [])),
-                "memory_reads": len(evidence.read_set),
-            }
-            cost.record(
-                "query_probe",
-                scope="query_probe",
-                duration_ms=elapsed_ms,
-                counters=counters,
-                arm=arm.value,
-                query_sha256=query_probes[arm.value]["question_sha256"],
-                deleted_source_exposed=deleted_exposed,
-                evidence_complete=bool(details.get("evidence_complete", False)),
-            )
+        # Continuation is a separate oracle from the pre-query visible state.
+        # Compare the same question IDs against the independent M0 probe only
+        # when both probes were isolated and evidence was observed.
+        m0_records = query_probes[MaintenanceArm.M0_FULL_REBUILD.value]["records"]
+        m0_by_id = {record["question_id"]: record for record in m0_records}
+        for arm_name, probe_group in query_probes.items():
+            checks: list[bool] = []
+            for record in probe_group["records"]:
+                reference_record = m0_by_id.get(record["question_id"])
+                passed = bool(
+                    reference_record
+                    and record.get("query_isolated")
+                    and reference_record.get("query_isolated")
+                    and record.get("answer_sha256") == reference_record.get("answer_sha256")
+                    and record.get("evidence_sha256") == reference_record.get("evidence_sha256")
+                    and not record.get("deleted_source_exposed")
+                )
+                record["answer_equal_to_m0"] = bool(
+                    reference_record and record.get("answer_sha256") == reference_record.get("answer_sha256")
+                )
+                record["evidence_equal_to_m0"] = bool(
+                    reference_record and record.get("evidence_sha256") == reference_record.get("evidence_sha256")
+                )
+                record["continuation_check_passed"] = passed
+                checks.append(passed)
+            probe_group["continuation_checks_passed"] = bool(checks) and all(checks)
         summary = _summary(
             instance,
             outputs,
@@ -269,6 +431,32 @@ def main() -> int:
                     exact_to_reference=None,
                     phase="baseline_setup",
                 )
+        # The paired arms share one immutable baseline runtime.  Record that
+        # build once as a lifecycle component rather than duplicating it in
+        # each M1-M3 arm (or silently omitting it from the ledger).
+        shared_baseline = next(
+            (
+                result.metadata.get("shared_baseline_cost")
+                for result, _comparison in outputs.values()
+                if isinstance(result.metadata.get("shared_baseline_cost"), dict)
+            ),
+            None,
+        )
+        if shared_baseline is not None:
+            cost.record_arm_cost(
+                arm="shared_baseline",
+                cost=SimpleNamespace(**shared_baseline),
+                exact_to_reference=None,
+                phase="common_baseline",
+            )
+        reference_repeat = outputs[MaintenanceArm.M0_FULL_REBUILD][0].metadata.get("reference_repeat_cost")
+        if isinstance(reference_repeat, dict):
+            cost.record_arm_cost(
+                arm="reference_repeat",
+                cost=SimpleNamespace(**reference_repeat),
+                exact_to_reference=None,
+                phase="reference_repeat",
+            )
         trace.record(
             "q01_instance_complete",
             instance_id=instance_id,
@@ -288,6 +476,7 @@ def main() -> int:
                 "num_instances": len(store.completed_ids(validate=True)),
                 "resume": args.resume,
                 "retrieve_k": args.retrieve_k,
+                "query_limit": args.query_limit,
                 "agent_model": args.agent_model,
             },
             extra={"run_fingerprint_sha256": store.load_fingerprint()["sha256"]},

@@ -5,12 +5,15 @@ adds an audit layer around that adapter without changing its behavior: source
 IDs are bound to note IDs, note snapshots are serialised, retrieval selection
 is captured by a temporary retriever hook, and note evolution decisions become
 ProvenanceEvent records.  The wrapper deliberately fails loudly for explicit
-forget unless the wrapped implementation provides a real deletion API; Q01
-M0-M3 arms use fresh factory instances and replay instead.
+forget unless the wrapped implementation provides a real deletion API. Q01
+uses two independent M0 rebuilds and a forkable shared baseline for M1--M3;
+checkpoint restore and suffix work are counted separately.
 """
 from __future__ import annotations
 
 import hashlib
+import copy
+import json
 import re
 import time
 from contextlib import contextmanager
@@ -113,6 +116,72 @@ class AmemResearchWrapper(MemoryBackend):
         self._llm_trace: list[dict[str, Any]] = []
         self._query_records: list[CanonicalQuery] = []
         self._logical_ids: dict[str, str] = {}
+        self._trace_context: dict[str, Any] = {
+            "instance_id": "unknown",
+            "base_instance_id": "unknown",
+            "scenario_id": "unknown",
+            "arm": "unknown",
+            "phase": "unknown",
+        }
+        self._checkpoints: dict[int, "AmemResearchWrapper"] = {}
+
+    def fork(self, *, trace: Any | None = None) -> "AmemResearchWrapper":
+        """Fork the already-built runtime without re-observing provider input.
+
+        A-MEM has no public clone API.  The adapter may provide ``fork``; the
+        offline and simple adapters are otherwise copied with ``deepcopy``.
+        Failure is explicit because silently falling back to prefix replay
+        would mislabel a full rebuild as an incremental checkpoint arm.
+        """
+
+        adapter_fork = getattr(self.adapter, "fork", None)
+        if callable(adapter_fork):
+            adapter = adapter_fork()
+        else:
+            try:
+                adapter = copy.deepcopy(self.adapter)
+            except Exception as exc:
+                raise RuntimeError(
+                    "adapter does not support an in-memory fork; checkpoint replay is unavailable"
+                ) from exc
+        clone = object.__new__(type(self))
+        clone.adapter = adapter
+        clone.retrieve_k = self.retrieve_k
+        clone.trace = trace
+        clone._source_records = copy.deepcopy(self._source_records)
+        clone._source_to_objects = copy.deepcopy(self._source_to_objects)
+        clone._object_support = copy.deepcopy(self._object_support)
+        clone._tombstones = copy.deepcopy(self._tombstones)
+        clone._events = copy.deepcopy(self._events)
+        clone._step = self._step
+        clone._llm_trace = copy.deepcopy(self._llm_trace)
+        clone._query_records = copy.deepcopy(self._query_records)
+        clone._logical_ids = copy.deepcopy(self._logical_ids)
+        clone._trace_context = copy.deepcopy(self._trace_context)
+        clone._checkpoints = {}
+        return clone
+
+    def _save_checkpoint(self, event_count: int) -> None:
+        self._checkpoints[event_count] = self.fork(trace=None)
+
+    def fork_checkpoint(self, event_count: int, *, trace: Any | None = None) -> tuple["AmemResearchWrapper", int]:
+        checkpoint = self._checkpoints.get(event_count)
+        if checkpoint is None:
+            raise RuntimeError(
+                f"no runtime checkpoint exists at event boundary {event_count}; "
+                "a provider-specific checkpoint/fork is required"
+            )
+        clone = checkpoint.fork(trace=trace)
+        try:
+            checkpoint_bytes = len(json.dumps(checkpoint.canonical_snapshot().model_dump(mode="json"), ensure_ascii=False))
+        except Exception:
+            checkpoint_bytes = len(repr(checkpoint._system()))
+        return clone, checkpoint_bytes
+
+    def set_trace_context(self, **fields: Any) -> None:
+        """Attach stable run/history/arm/phase identifiers to future events."""
+
+        self._trace_context.update({key: value for key, value in fields.items() if value is not None})
 
     def _system(self) -> Any:
         return getattr(self.adapter, "_system", self.adapter)
@@ -239,11 +308,20 @@ class AmemResearchWrapper(MemoryBackend):
                 value = getattr(system, name)
                 if isinstance(value, (str, int, float, bool)) or value is None:
                     counters[name] = value
+        def value_hash(value: Any) -> str | None:
+            if value is None:
+                return None
+            try:
+                return _hash_text(repr(value))
+            except Exception:
+                return _hash_text(type(value).__name__)
         return {
             "queue_available": queue is not None,
             "queue_size": len(queue) if hasattr(queue, "__len__") else None,
+            "queue_hash": value_hash(queue),
             "cache_available": cache is not None,
             "cache_size": len(cache) if hasattr(cache, "__len__") else None,
+            "cache_hash": value_hash(cache),
             "counters": counters,
         }
 
@@ -293,24 +371,40 @@ class AmemResearchWrapper(MemoryBackend):
             return
         calls: list[dict[str, Any]] = []
 
-        def wrapped(prompt: str, temperature: float = 0.7, *args: Any, **kwargs: Any) -> str:
-            prompt_hash = _hash_text(str(prompt))
-            response = completion(prompt, *args, temperature=temperature, **kwargs)
+        def usage_value(usage: Mapping[str, Any], *names: str) -> int | None:
+            for name in names:
+                if name in usage and usage[name] is not None:
+                    try:
+                        return int(usage[name])
+                    except (TypeError, ValueError):
+                        return None
+            return None
+
+        def record_provider_call(
+            *,
+            response: Any,
+            prompt_hash: str,
+            usage: Mapping[str, Any],
+            call_kind: str,
+            temperature: Any = None,
+            task: str | None = None,
+        ) -> dict[str, Any]:
             response_text = str(response)
-            usage = dict(getattr(llm, "last_usage", {}) or {})
-            input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
-            output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
-            entry = {
-                "call_kind": self._call_kind(str(prompt)),
+            entry: dict[str, Any] = {
+                "call_kind": call_kind,
+                "task": task or call_kind,
                 "prompt_hash": prompt_hash,
                 "response_hash": _hash_text(response_text),
                 "temperature": temperature,
                 "decision": self._branch_label(response_text),
-                "input_tokens": int(input_tokens or 0),
-                "output_tokens": int(output_tokens or 0),
+                # ``None`` means provider usage was not exposed.  It is kept
+                # distinct from a measured zero in both trace and cost code.
+                "input_tokens": usage_value(usage, "prompt_tokens", "input_tokens"),
+                "output_tokens": usage_value(usage, "completion_tokens", "output_tokens"),
+                "usage_observed": bool(usage),
             }
             if usage:
-                entry["usage"] = usage
+                entry["usage"] = dict(usage)
             calls.append(entry)
             self._llm_trace.append(entry)
             self._next_event(
@@ -320,49 +414,57 @@ class AmemResearchWrapper(MemoryBackend):
                 output_hashes=[entry["response_hash"]],
                 metadata={key: value for key, value in entry.items() if key not in {"prompt_hash", "response_hash"}},
             )
-            return response_text
+            return entry
 
-        if callable(completion):
-            setattr(llm, "get_completion", wrapped)
+        def wrapped(prompt: str, temperature: float = 0.7, *args: Any, **kwargs: Any) -> str:
+            prompt_hash = _hash_text(str(prompt))
+            response = completion(prompt, *args, temperature=temperature, **kwargs)
+            usage = dict(getattr(llm, "last_usage", {}) or {})
+            # This fallback is used only when no provider-level ``chat`` hook
+            # exists.  When both surfaces exist, wrapping both would count the
+            # same provider request twice because get_completion delegates to
+            # chat in the production A-MEM bridge.
+            record_provider_call(
+                response=response,
+                prompt_hash=prompt_hash,
+                usage=usage,
+                call_kind=self._call_kind(str(prompt)),
+                temperature=temperature,
+                task="amem_internal",
+            )
+            return str(response)
 
         def wrapped_chat(messages: Any, *args: Any, **kwargs: Any) -> Any:
-            # The official adapter's answer path uses Bemula's ``llm.chat``
-            # rather than A-MEM's internal ``get_completion``.  Capture that
-            # call here so query probes do not silently omit answer-model
-            # tokens from the lifecycle cost ledger.
+            # Record once at the provider boundary.  The same hook sees both
+            # A-MEM internal calls (task=amem_internal) and answer calls; the
+            # nested get_completion wrapper is deliberately not installed.
             response = adapter_chat(messages, *args, **kwargs)
-            response_text = str(response)
             usage = dict(getattr(adapter_llm, "last_usage", {}) or {})
-            input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
-            output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
             prompt_hash = _hash_text(repr(messages))
-            entry = {
-                "call_kind": "query_answer",
-                "prompt_hash": prompt_hash,
-                "response_hash": _hash_text(response_text),
-                "temperature": kwargs.get("temperature"),
-                "decision": None,
-                "input_tokens": int(input_tokens or 0),
-                "output_tokens": int(output_tokens or 0),
-            }
-            if usage:
-                entry["usage"] = usage
-            calls.append(entry)
-            self._llm_trace.append(entry)
-            self._next_event(
-                ProvenanceEventType.LLM_CALL,
-                input_hashes=[prompt_hash],
-                output_hashes=[entry["response_hash"]],
-                metadata={key: value for key, value in entry.items() if key not in {"prompt_hash", "response_hash"}},
+            task = str(kwargs.get("task", ""))
+            call_kind = "query_answer" if task in {"", "amem_answer"} else (
+                "amem_internal" if task == "amem_internal" else self._call_kind(repr(messages))
+            )
+            record_provider_call(
+                response=response,
+                prompt_hash=prompt_hash,
+                usage=usage,
+                call_kind=call_kind,
+                temperature=kwargs.get("temperature"),
+                task=task or call_kind,
             )
             return response
 
+        # Prefer the real provider boundary.  Only install the completion hook
+        # when no lower-level chat surface is available.
         if callable(adapter_chat):
             setattr(adapter_llm, "chat", wrapped_chat)
+        elif callable(completion):
+            setattr(llm, "get_completion", wrapped)
         try:
             yield calls
         finally:
-            if callable(completion):
+            if callable(completion) and not callable(adapter_chat):
                 setattr(llm, "get_completion", completion)
             if callable(adapter_chat):
                 setattr(adapter_llm, "chat", adapter_chat)
@@ -382,7 +484,75 @@ class AmemResearchWrapper(MemoryBackend):
             "context_object_ids": [],
             "context_source_ids": [],
             "context_mapping_complete": False,
+            "context_coverage": False,
+            "context_coverage_ratio": 0.0,
+            "lineage_coverage": False,
+            "retrieval_score_coverage": False,
+            "unmapped_context_hash": None,
         }
+
+        def map_rendered_context(rendered: str) -> None:
+            """Map raw context spans conservatively and expose coverage layers.
+
+            A text-only upstream renderer does not expose its fragment
+            boundaries.  We therefore mark every non-whitespace character not
+            covered by a known note payload as unmapped.  This deliberately
+            produces ``incomplete`` for templates, tool/cache tails, or other
+            renderer text until a structured segment hook is available.
+            """
+
+            memories = self._memories()
+            matches: list[tuple[int, int, str]] = []
+            for note_id, note in memories.items():
+                content = self._note_content(note)
+                if not content:
+                    continue
+                start = 0
+                while True:
+                    position = rendered.find(content, start)
+                    if position < 0:
+                        break
+                    matches.append((position, position + len(content), note_id))
+                    start = position + max(1, len(content))
+            matches.sort(key=lambda item: (item[0], -(item[1] - item[0]), item[2]))
+            selected_matches: list[tuple[int, int, str]] = []
+            covered_until = -1
+            for start, end, note_id in matches:
+                if start < covered_until:
+                    continue
+                selected_matches.append((start, end, note_id))
+                covered_until = end
+            context_ids = sorted({note_id for _, _, note_id in selected_matches})
+            intervals = [(start, end) for start, end, _ in selected_matches]
+            unknown_parts: list[str] = []
+            cursor = 0
+            for start, end in intervals:
+                if start > cursor:
+                    unknown_parts.append(rendered[cursor:start])
+                cursor = max(cursor, end)
+            if cursor < len(rendered):
+                unknown_parts.append(rendered[cursor:])
+            unknown_text = "".join(unknown_parts)
+            unknown_non_ws = "".join(character for character in unknown_text if not character.isspace())
+            mapped_chars = sum(end - start for start, end in intervals)
+            non_ws_chars = sum(1 for character in rendered if not character.isspace())
+            context_coverage = not unknown_non_ws
+            lineage_coverage = context_coverage and all(
+                bool(self._object_support.get(note_id)) for note_id in context_ids
+            )
+            captured["context_object_ids"] = context_ids
+            captured["context_source_ids"] = sorted({
+                source
+                for note_id in context_ids
+                for source in self._object_support.get(note_id, set())
+            })
+            captured["context_mapping_complete"] = context_coverage and lineage_coverage
+            captured["context_coverage"] = context_coverage
+            captured["context_coverage_ratio"] = (
+                float(mapped_chars) / float(non_ws_chars) if non_ws_chars else 1.0
+            )
+            captured["lineage_coverage"] = lineage_coverage
+            captured["unmapped_context_hash"] = _hash_text(unknown_text) if unknown_text else None
 
         def score_indices(query: str, indices: Any) -> None:
             try:
@@ -417,27 +587,7 @@ class AmemResearchWrapper(MemoryBackend):
             rendered = str(result)
             captured["raw_context_hash"] = _hash_text(rendered)
             captured["raw_context_chars"] = len(rendered)
-            # The robust A-MEM path expands linked neighbours into the final
-            # context.  When the backend returns text only, map every known
-            # note whose payload is present in that context.  This is a
-            # conservative observation: an unmapped payload keeps the trace
-            # explicitly incomplete instead of claiming exact evidence.
-            context_ids: list[str] = []
-            for note_id, note in self._memories().items():
-                content = self._note_content(note)
-                if content and content in rendered:
-                    context_ids.append(note_id)
-            captured["context_object_ids"] = sorted(set(context_ids))
-            captured["context_source_ids"] = sorted({
-                source
-                for note_id in context_ids
-                for source in self._object_support.get(note_id, set())
-            })
-            captured["context_mapping_complete"] = bool(context_ids) and all(
-                self._note_content(note) in rendered
-                for note in self._memories().values()
-                if self._note_content(note) and self._note_content(note) in rendered
-            )
+            map_rendered_context(rendered)
             return result
 
         if not callable(search):
@@ -469,6 +619,7 @@ class AmemResearchWrapper(MemoryBackend):
             if callable(raw_finder):
                 setattr(system, "find_related_memories_raw", raw_finder)
         selected = captured["candidate_ids"][: self.retrieve_k]
+        captured["retrieval_score_coverage"] = bool(captured["scores_available"])
         return answer, captured["candidate_ids"], selected, captured
 
     def _record(self, event: ProvenanceEvent) -> None:
@@ -476,7 +627,9 @@ class AmemResearchWrapper(MemoryBackend):
         if self.trace is not None:
             callback = getattr(self.trace, "record_event", None)
             if callback is not None:
-                callback(event.model_dump(mode="json"))
+                payload = event.model_dump(mode="json")
+                payload.update({key: value for key, value in self._trace_context.items() if value is not None})
+                callback(payload)
 
     def _next_event(
         self,
@@ -494,8 +647,14 @@ class AmemResearchWrapper(MemoryBackend):
         output_hashes: Sequence[str] = (),
     ) -> ProvenanceEvent:
         self._step += 1
+        context = dict(self._trace_context)
+        operation_id = str(
+            context.get("operation_id")
+            or f"{context.get('instance_id', 'unknown')}:{context.get('arm', 'unknown')}:{context.get('phase', 'unknown')}:{self._step:06d}"
+        )
+        event_metadata = {**context, "operation_id": operation_id, **dict(metadata or {})}
         event = ProvenanceEvent(
-            event_id=f"amem-event:{self._step:06d}",
+            event_id=f"{operation_id}:{event_type.value}",
             event_type=event_type,
             step=self._step,
             source_ids=list(source_ids),
@@ -507,7 +666,7 @@ class AmemResearchWrapper(MemoryBackend):
             query_id=query_id,
             input_hashes=list(input_hashes),
             output_hashes=list(output_hashes),
-            metadata=dict(metadata or {}),
+            metadata=event_metadata,
         )
         self._record(event)
         return event
@@ -558,6 +717,14 @@ class AmemResearchWrapper(MemoryBackend):
             note_id for note_id in before_ids & after_ids
             if before[note_id].model_dump(mode="json") != after[note_id].model_dump(mode="json")
         )
+        # Establish physical-ID-independent identity at first materialization.
+        # Later content/timestamp changes create new versions of the same
+        # logical object instead of changing the identity based on when a
+        # snapshot happened to be taken.
+        for object_id in new_ids:
+            record = after.get(object_id)
+            if record is not None:
+                self._ensure_logical_id(object_id.removeprefix("note:"), record)
         object_ids = [item.removeprefix("note:") for item in new_ids + changed_ids]
         # A NOOP is an execution decision and must not fabricate a materialized
         # object by attaching the input to an arbitrary existing note.
@@ -599,7 +766,7 @@ class AmemResearchWrapper(MemoryBackend):
         }[decision]
         self._next_event(
             event_type,
-            source_ids=[sid],
+            source_ids=sorted(support_sources),
             object_ids=object_ids,
             selected_ids=object_ids,
             # The write decision is conditioned on the objects observed by
@@ -612,6 +779,8 @@ class AmemResearchWrapper(MemoryBackend):
             metadata={
                 "speaker": turn.speaker,
                 "timestamp": turn.timestamp,
+                "current_source_id": sid,
+                "content_support_ids": sorted(support_sources),
                 "llm_calls": list(llm_calls),
                 "index_before": index_before,
                 "index_after": index_after,
@@ -621,7 +790,8 @@ class AmemResearchWrapper(MemoryBackend):
                 },
             },
         )
-        self._source_to_objects.setdefault(sid, set()).update(object_ids)
+        for support_source in support_sources:
+            self._source_to_objects.setdefault(support_source, set()).update(object_ids)
         source = SourceRecord(
             source_id=sid,
             content=turn.text,
@@ -651,10 +821,13 @@ class AmemResearchWrapper(MemoryBackend):
         support_ids = sorted(set(support_ids) | context_support_ids)
         read_object_ids = sorted(set(selected_ids) | set(context_object_ids))
         context_mapping_complete = bool(retrieval_details.get("context_mapping_complete"))
+        context_coverage = bool(retrieval_details.get("context_coverage"))
+        lineage_coverage = bool(retrieval_details.get("lineage_coverage"))
         evidence_complete = bool(
             retrieval_details.get("raw_context_hash")
+            and context_coverage
+            and lineage_coverage
             and context_mapping_complete
-            and retrieval_details.get("scores_available")
         )
         query_id = f"query:{_hash_text(question)[:16]}"
         self._next_event(
@@ -670,6 +843,9 @@ class AmemResearchWrapper(MemoryBackend):
             metadata={
                 "llm_calls": list(llm_calls),
                 "evidence_complete": evidence_complete,
+                "context_coverage": context_coverage,
+                "lineage_coverage": lineage_coverage,
+                "retrieval_score_coverage": bool(retrieval_details.get("scores_available")),
                 **retrieval_details,
             },
         )
@@ -686,6 +862,9 @@ class AmemResearchWrapper(MemoryBackend):
             metadata={
                 "llm_calls": list(llm_calls),
                 "evidence_complete": evidence_complete,
+                "context_coverage": context_coverage,
+                "lineage_coverage": lineage_coverage,
+                "retrieval_score_coverage": bool(retrieval_details.get("scores_available")),
                 **retrieval_details,
             },
         )
@@ -722,6 +901,9 @@ class AmemResearchWrapper(MemoryBackend):
                     "provenance_quality": "wrapper_delta",
                     "answer_retrieval_is_best_effort": True,
                     "evidence_complete": evidence_complete,
+                    "context_coverage": context_coverage,
+                    "lineage_coverage": lineage_coverage,
+                    "retrieval_score_coverage": bool(retrieval_details.get("scores_available")),
                     "llm_calls": list(llm_calls),
                     **retrieval_details,
                 },
@@ -755,6 +937,11 @@ class AmemResearchWrapper(MemoryBackend):
         logical = f"note-sem:{_hash_text(seed)[:24]}"
         self._logical_ids[note_id] = logical
         return logical
+
+    def _ensure_logical_id(self, note_id: str, record: SourceRecord) -> str:
+        """Assign identity once, at object creation, rather than at export."""
+
+        return self._logical_note_id(note_id, record)
 
     def _logical_links(self, note_id: str, record: SourceRecord) -> list[str]:
         """Normalize A-MEM integer neighbor positions to logical note IDs."""
@@ -805,6 +992,7 @@ class AmemResearchWrapper(MemoryBackend):
                     content_hash=_hash_text(record.content),
                     canonical_id=self._logical_note_id(note_id, record),
                     version=record.version,
+                    timestamp=record.timestamp,
                     support_set=list(record.support_set),
                     parent_ids=self._logical_links(note_id, record),
                     visible=True,
@@ -992,36 +1180,75 @@ class AmemHistoryBuilder:
 
     name = "amem-research-builder"
 
-    def __init__(self, factory: AmemAdapterFactory, *, retrieve_k: int = 10, trace: Any | None = None):
+    def __init__(
+        self,
+        factory: AmemAdapterFactory,
+        *,
+        retrieve_k: int = 10,
+        trace: Any | None = None,
+        trace_context: Mapping[str, Any] | None = None,
+    ):
         self.factory = factory
         self.retrieve_k = retrieve_k
         self.trace = trace
+        self.trace_context = dict(trace_context or {})
 
     def _new(self) -> AmemResearchWrapper:
-        return AmemResearchWrapper(self.factory(), retrieve_k=self.retrieve_k, trace=self.trace)
+        wrapper = AmemResearchWrapper(self.factory(), retrieve_k=self.retrieve_k, trace=self.trace)
+        wrapper.set_trace_context(**self.trace_context)
+        return wrapper
 
     @staticmethod
-    def _embedding_counters(wrapper: AmemResearchWrapper) -> tuple[int, int]:
+    def _embedding_counters(wrapper: AmemResearchWrapper) -> tuple[int | None, int | None]:
         """Read optional embedder counters without requiring a provider API.
 
         The controlled preflight embedder exposes these counters, and a real
         provider may expose the same optional attributes.  Missing counters
-        remain explicitly zero rather than being inferred from index size.
+        remain explicitly unknown rather than being inferred from index size.
         """
 
         embedder = getattr(wrapper.adapter, "embedder", None)
-        calls = getattr(embedder, "calls", 0)
-        items = getattr(embedder, "items", 0)
+        if embedder is None or not hasattr(embedder, "calls") or not hasattr(embedder, "items"):
+            return None, None
+        calls = getattr(embedder, "calls", None)
+        items = getattr(embedder, "items", None)
         try:
-            return int(calls or 0), int(items or 0)
+            if calls is None or items is None:
+                return None, None
+            return int(calls), int(items)
         except (TypeError, ValueError):
-            return 0, 0
+            return None, None
+
+    @staticmethod
+    def _usage_total(
+        wrapper: AmemResearchWrapper,
+        field: str,
+        events: Sequence[ProvenanceEvent] | None = None,
+    ) -> int | None:
+        observed_events = list(events) if events is not None else wrapper.provenance_events
+        values = [
+            event.metadata.get(field)
+            for event in observed_events
+            if event.event_type is ProvenanceEventType.LLM_CALL
+        ]
+        if not values or any(value is None for value in values):
+            return None
+        try:
+            return sum(int(value) for value in values)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _counter_delta(after: int | None, before: int | None) -> int | None:
+        if after is None or before is None:
+            return None
+        return max(0, after - before)
 
     @staticmethod
     def _turn(event: SourceEvent) -> Turn:
         metadata = dict(event.metadata)
         return Turn(
-            speaker=str(metadata.get("speaker", "user")),
+            speaker=str(event.speaker or metadata.get("speaker", "user")),
             text=event.content,
             timestamp=event.timestamp,
             linked_fact_ids=list(metadata.get("linked_fact_ids", [])),
@@ -1043,6 +1270,7 @@ class AmemHistoryBuilder:
                 continue
             before = len(wrapper.decision_events)
             wrapper.observe(self._turn(event), source_id=event.source_id)
+            wrapper._save_checkpoint(index + 1)
             replayed += 1
             new_events = wrapper.decision_events[before:]
             decision = next(
@@ -1094,14 +1322,21 @@ class AmemHistoryBuilder:
         start_index: int = 0,
         prefix_wrapper: AmemResearchWrapper | None = None,
         replayed_events: int | None = None,
+        trace_phase: str = "build",
     ) -> AmemHistoryResult:
         deleted = set(deleted_ids)
         wrapper = prefix_wrapper or self._new()
+        wrapper.set_trace_context(arm=arm.value, phase=trace_phase)
+        if start_index not in wrapper._checkpoints:
+            wrapper._checkpoints[start_index] = wrapper.fork(trace=None)
+        event_start = len(wrapper.provenance_events)
         embedding_calls_before, embedding_items_before = self._embedding_counters(wrapper)
         steps, replayed = self._ingest(wrapper, events, deleted, start_index=start_index)
         if replayed_events is not None:
             replayed = replayed_events
         snapshot = wrapper.snapshot()
+        new_events = wrapper.provenance_events[event_start:]
+        processed_events = events[start_index:]
         cost = BuildCost(
             input_events=len(events),
             replayed_events=replayed,
@@ -1109,39 +1344,28 @@ class AmemHistoryBuilder:
             generated_objects=sum(len(step.output_ids) for step in steps),
             state_records=len(snapshot.records),
             llm_calls=sum(
-                1 for event in wrapper.provenance_events
-                if event.event_type is ProvenanceEventType.LLM_CALL
+                1 for event in new_events if event.event_type is ProvenanceEventType.LLM_CALL
             ),
-            input_tokens=sum(
-                int(event.metadata.get("input_tokens", 0) or 0)
-                for event in wrapper.provenance_events
-                if event.event_type is ProvenanceEventType.LLM_CALL
-            ),
-            output_tokens=sum(
-                int(event.metadata.get("output_tokens", 0) or 0)
-                for event in wrapper.provenance_events
-                if event.event_type is ProvenanceEventType.LLM_CALL
-            ),
+            input_tokens=self._usage_total(wrapper, "input_tokens", new_events),
+            output_tokens=self._usage_total(wrapper, "output_tokens", new_events),
             memory_reads=sum(
-                1 for event in wrapper.provenance_events
+                1 for event in new_events
                 if event.event_type in {ProvenanceEventType.CANDIDATE, ProvenanceEventType.READ}
             ),
             index_updates=sum(
-                1 for event in wrapper.provenance_events
+                1 for event in new_events
                 if event.event_type in {ProvenanceEventType.WRITE, ProvenanceEventType.UPDATE}
             ),
             bytes_read=sum(
                 len(event.content.encode("utf-8"))
-                for event in events
+                for event in processed_events
                 if event.source_id not in deleted
             ),
-            embedding_calls=max(
-                0,
-                self._embedding_counters(wrapper)[0] - embedding_calls_before,
+            embedding_calls=self._counter_delta(
+                self._embedding_counters(wrapper)[0], embedding_calls_before
             ),
-            embedding_items=max(
-                0,
-                self._embedding_counters(wrapper)[1] - embedding_items_before,
+            embedding_items=self._counter_delta(
+                self._embedding_counters(wrapper)[1], embedding_items_before
             ),
         )
         return AmemHistoryResult(
@@ -1160,11 +1384,18 @@ class AmemHistoryBuilder:
         arm: MaintenanceArm,
         *,
         baseline: AmemHistoryResult | None = None,
+        trace_phase: str | None = None,
     ) -> AmemHistoryResult:
         deleted = set(deleted_ids)
         if arm is MaintenanceArm.M0_FULL_REBUILD:
             kept = [event for event in events if event.source_id not in deleted]
-            result = self.build(kept, arm=arm, deleted_ids=(), replayed_events=len(kept))
+            result = self.build(
+                kept,
+                arm=arm,
+                deleted_ids=(),
+                replayed_events=len(kept),
+                trace_phase=trace_phase or "reference_rebuild",
+            )
             # The reference rebuild is evaluated for the same deletion
             # request.  Preserve the audit tombstone even though the removed
             # event is absent from the replay input.
@@ -1178,10 +1409,12 @@ class AmemHistoryBuilder:
             # snapshot leaves the baseline adapter serving deleted notes.  Apply
             # the same conservative source/support rule to the wrapper's live
             # state, then derive the snapshot from that state.
-            embedding_calls_before, embedding_items_before = self._embedding_counters(baseline.wrapper)
-            index_updates = self._apply_live_tombstones(baseline.wrapper, deleted)
-            embedding_calls_after, embedding_items_after = self._embedding_counters(baseline.wrapper)
-            snapshot = baseline.wrapper.snapshot()
+            live_wrapper = baseline.wrapper.fork(trace=self.trace)
+            live_wrapper.set_trace_context(arm=arm.value, phase="maintenance")
+            embedding_calls_before, embedding_items_before = self._embedding_counters(live_wrapper)
+            index_updates = self._apply_live_tombstones(live_wrapper, deleted)
+            embedding_calls_after, embedding_items_after = self._embedding_counters(live_wrapper)
+            snapshot = live_wrapper.snapshot()
             return AmemHistoryResult(
                 arm=arm,
                 snapshot=snapshot,
@@ -1190,11 +1423,11 @@ class AmemHistoryBuilder:
                     input_events=len(events),
                     state_records=len(snapshot.records),
                     index_updates=index_updates,
-                    embedding_calls=max(0, embedding_calls_after - embedding_calls_before),
-                    embedding_items=max(0, embedding_items_after - embedding_items_before),
-                    cost_scope="maintenance_full_execution",
+                    embedding_calls=self._counter_delta(embedding_calls_after, embedding_calls_before),
+                    embedding_items=self._counter_delta(embedding_items_after, embedding_items_before),
+                    cost_scope="maintenance_live_tombstone",
                 ),
-                wrapper=baseline.wrapper,
+                wrapper=live_wrapper,
                 metadata={
                     "builder": self.name,
                     "replay_start": 0,
@@ -1203,6 +1436,8 @@ class AmemHistoryBuilder:
                     # arm remains an explicit over-delete baseline.
                     "tombstone_policy": "conservative_cascade",
                     "index_rebuilt": bool(index_updates),
+                    "cost_scope": "maintenance_live_tombstone",
+                    "shared_baseline": True,
                 },
             )
         # M2 is the conservative suffix baseline: it invalidates from the
@@ -1218,22 +1453,15 @@ class AmemHistoryBuilder:
         else:
             start = self._earliest_affected_index(events, deleted, baseline)
             replay_mode = "read_control_closure"
-        wrapper = self._new()
-        # Build a stable checkpoint containing only the unaffected prefix.
-        # Re-ingesting the complete history here would duplicate notes before
-        # the replay point and invalidate M2/M3 state comparisons.
-        embedding_calls_before_prefix, embedding_items_before_prefix = self._embedding_counters(wrapper)
-        prefix_steps, prefix_replayed = self._ingest(wrapper, events[:start], deleted, start_index=0)
-        embedding_calls_after_prefix, embedding_items_after_prefix = self._embedding_counters(wrapper)
-        prefix_embedding_calls = max(0, embedding_calls_after_prefix - embedding_calls_before_prefix)
-        prefix_embedding_items = max(0, embedding_items_after_prefix - embedding_items_before_prefix)
-        # Rebuild the prefix as a checkpoint, then count only the suffix work.
+        wrapper, checkpoint_bytes = baseline.wrapper.fork_checkpoint(start, trace=self.trace)
+        wrapper.set_trace_context(arm=arm.value, phase="maintenance")
         suffix_result = self.build(
             events,
             arm=arm,
             deleted_ids=deleted,
             start_index=start,
             prefix_wrapper=wrapper,
+            trace_phase="maintenance_checkpoint_replay",
         )
         suffix_result.metadata.update(
             {
@@ -1241,37 +1469,31 @@ class AmemHistoryBuilder:
                 "affected_steps": [step.index for step in baseline.trace if step.index >= start],
                 "replay_mode": replay_mode,
                 "m3_status": (
-                    "implemented_materialized_read_control_baseline"
+                    "limited_materialized_read_control_checkpoint_replay"
                     if arm is MaintenanceArm.M3_READ_SET
-                    else "conservative_suffix_baseline"
+                    else "conservative_suffix_checkpoint_replay"
                 ),
+                "checkpoint_restored": True,
+                "checkpoint_source": "shared_baseline_runtime",
+                "checkpoint_event": start,
             }
         )
         suffix_replayed = suffix_result.cost.replayed_events
-        # ``suffix_result`` already measures model/read/index work over the
-        # complete live wrapper, but its replay counter and generated/candidate
-        # counters historically covered only the suffix.  Charge the prefix
-        # re-ingest explicitly; this is not checkpoint restoration.
         suffix_result.cost = replace(
             suffix_result.cost,
             input_events=len(events),
-            replayed_events=prefix_replayed + suffix_replayed,
-            prefix_replayed_events=prefix_replayed,
+            replayed_events=suffix_replayed,
+            prefix_replayed_events=0,
             suffix_replayed_events=suffix_replayed,
-            embedding_calls=suffix_result.cost.embedding_calls + prefix_embedding_calls,
-            embedding_items=suffix_result.cost.embedding_items + prefix_embedding_items,
-            retrieved_candidates=suffix_result.cost.retrieved_candidates
-            + sum(len(step.candidate_ids) for step in prefix_steps),
-            generated_objects=suffix_result.cost.generated_objects
-            + sum(len(step.output_ids) for step in prefix_steps),
-            cost_scope="maintenance_full_execution",
+            checkpoint_restore_events=1,
+            checkpoint_restore_bytes=checkpoint_bytes,
+            cost_scope="maintenance_checkpoint_replay",
         )
         suffix_result.metadata.update(
             {
-                "prefix_events": prefix_replayed,
+                "prefix_events": start,
                 "suffix_events": suffix_replayed,
-                "cost_scope": "maintenance_full_execution",
-                "checkpoint_restored": False,
+                "cost_scope": "maintenance_checkpoint_replay",
             }
         )
         return suffix_result
@@ -1294,6 +1516,7 @@ class AmemHistoryBuilder:
             wrapper._source_to_objects.pop(source_id, None)
 
         memories = getattr(wrapper._system(), "memories", None)
+        old_memory_order = list(memories) if isinstance(memories, Mapping) else []
         remove_ids: set[str] = set()
         for object_id, support in list(wrapper._object_support.items()):
             # Preserve the policy boundary: any materialized object that was
@@ -1306,6 +1529,32 @@ class AmemHistoryBuilder:
         if isinstance(memories, Mapping):
             for object_id in remove_ids:
                 memories.pop(object_id, None)
+            survivor_order = list(memories)
+            old_to_new = {
+                old_index: new_index
+                for new_index, object_id in enumerate(survivor_order)
+                for old_index, old_id in enumerate(old_memory_order)
+                if old_id == object_id
+            }
+            # A-MEM stores links as integer positions.  Removing an earlier
+            # note must compact those positions without retargeting a link to
+            # the new occupant of the old integer slot.
+            for note in memories.values():
+                remapped: list[Any] = []
+                for raw_link in wrapper._note_links(note):
+                    try:
+                        old_index = int(raw_link)
+                    except (TypeError, ValueError):
+                        if str(raw_link) in memories:
+                            remapped.append(raw_link)
+                        continue
+                    new_index = old_to_new.get(old_index)
+                    if new_index is not None:
+                        remapped.append(new_index)
+                try:
+                    setattr(note, "links", remapped)
+                except Exception:
+                    pass
         for source_id, object_ids in list(wrapper._source_to_objects.items()):
             object_ids.difference_update(remove_ids)
             if not object_ids:
@@ -1393,71 +1642,109 @@ def run_amem_all_arms(
     *,
     retrieve_k: int = 10,
     trace: Any | None = None,
+    trace_context: Mapping[str, Any] | None = None,
 ) -> dict[MaintenanceArm, tuple[AmemHistoryResult, StateComparison]]:
     """Run the four fixed arms through a source-aware A-MEM wrapper."""
-    builder = AmemHistoryBuilder(factory, retrieve_k=retrieve_k, trace=trace)
+    builder = AmemHistoryBuilder(
+        factory,
+        retrieve_k=retrieve_k,
+        trace=trace,
+        trace_context=trace_context,
+    )
     deleted = tuple(dict.fromkeys(deleted_ids))
     reference_started = time.perf_counter()
-    reference = builder.run_arm(events, deleted, MaintenanceArm.M0_FULL_REBUILD)
+    reference = builder.run_arm(
+        events,
+        deleted,
+        MaintenanceArm.M0_FULL_REBUILD,
+        trace_phase="reference_rebuild",
+    )
     reference.cost = replace(
         reference.cost,
         wall_time_ms=(time.perf_counter() - reference_started) * 1000.0,
     )
+    repeat_started = time.perf_counter()
+    reference_repeat = builder.run_arm(
+        events,
+        deleted,
+        MaintenanceArm.M0_FULL_REBUILD,
+        trace_phase="reference_repeat",
+    )
+    reference_repeat.cost = replace(
+        reference_repeat.cost,
+        wall_time_ms=(time.perf_counter() - repeat_started) * 1000.0,
+    )
+    reference_diff = CanonicalStateComparator().compare(
+        reference.wrapper.canonical_snapshot(dataset="amem", instance_id="fixture"),
+        reference_repeat.wrapper.canonical_snapshot(dataset="amem", instance_id="fixture"),
+    )
+    common_started = time.perf_counter()
+    common_baseline = builder.build(
+        events,
+        arm=MaintenanceArm.M0_FULL_REBUILD,
+        trace_phase="common_baseline",
+    )
+    common_baseline.cost = replace(
+        common_baseline.cost,
+        wall_time_ms=(time.perf_counter() - common_started) * 1000.0,
+    )
     output: dict[MaintenanceArm, tuple[AmemHistoryResult, StateComparison]] = {}
-
-    def include_baseline_setup(result: AmemHistoryResult, baseline: AmemHistoryResult) -> None:
-        """Charge the baseline build actually executed for this arm.
-
-        The current paired runner constructs a fresh baseline for each arm so
-        mutable adapters cannot leak state across arms.  That setup work is
-        therefore part of the arm's measured execution and must not disappear
-        from the lifecycle ledger.  The result metadata retains the
-        incremental-only counters for readers who want to separate setup from
-        post-deletion maintenance.
-        """
-
-        incremental = dict(result.cost.__dict__)
-        setup = baseline.cost
-        result.metadata.update(
-            {
-                "paired_baseline_setup_included": True,
-                "baseline_setup_cost": dict(setup.__dict__),
-                "incremental_maintenance_cost": incremental,
-            }
-        )
 
     for arm in MaintenanceArm:
         if arm is MaintenanceArm.M0_FULL_REBUILD:
             result = reference
-        else:
-            setup_started = time.perf_counter()
-            baseline = builder.build(events, arm=MaintenanceArm.M0_FULL_REBUILD)
-            baseline.cost = replace(
-                baseline.cost,
-                wall_time_ms=(time.perf_counter() - setup_started) * 1000.0,
+            result.metadata.update(
+                {
+                    "reference_repeat": True,
+                    "reference_repeat_equal": reference_diff.equivalent,
+                    "reference_repeat_visible_equal": reference_diff.visible_equivalent,
+                    "reference_repeat_runtime_equal": reference_diff.runtime_equivalent,
+                    "reference_repeat_hash": reference_repeat.wrapper.canonical_hash(
+                        dataset="amem", instance_id="fixture"
+                    ),
+                    "reference_repeat_cost": dict(reference_repeat.cost.__dict__),
+                    "cost_scope": "reference_rebuild",
+                }
             )
+            # M0 must validate independent repeatability.  Comparing the
+            # reference object with itself would make the reference arm
+            # self-certifying even when the builder is nondeterministic.
+            comparison_reference = reference_repeat
+        else:
             maintenance_started = time.perf_counter()
-            result = builder.run_arm(events, deleted, arm, baseline=baseline)
-            include_baseline_setup(result, baseline)
+            result = builder.run_arm(events, deleted, arm, baseline=common_baseline)
+            result.metadata.update(
+                {
+                    "shared_baseline": True,
+                    "shared_baseline_cost": dict(common_baseline.cost.__dict__),
+                    "shared_baseline_wall_time_ms": common_baseline.cost.wall_time_ms,
+                }
+            )
             result.cost = replace(
                 result.cost,
-                # Baseline setup is recorded as its own cost event; this arm
-                # duration therefore covers only post-deletion maintenance.
                 wall_time_ms=(time.perf_counter() - maintenance_started) * 1000.0,
             )
+            comparison_reference = reference
         # Every arm must be compared through the same builder-specific
         # exporter.  M1 now filters the live wrapper, so comparing a generic
         # snapshot conversion against the A-MEM exporter would create a false
         # mismatch even for an empty deletion.
         left = result.wrapper.canonical_snapshot(dataset="amem", instance_id="fixture")
-        right = reference.wrapper.canonical_snapshot(dataset="amem", instance_id="fixture")
-        diff = CanonicalStateComparator().compare(left, right)
+        if arm is MaintenanceArm.M0_FULL_REBUILD:
+            right = reference_repeat.wrapper.canonical_snapshot(dataset="amem", instance_id="fixture")
+            diff = reference_diff
+        else:
+            right = comparison_reference.wrapper.canonical_snapshot(dataset="amem", instance_id="fixture")
+            diff = CanonicalStateComparator().compare(left, right)
         output[arm] = (
             result,
             StateComparison(
                 equal=diff.equivalent,
                 left_hash=diff.left_hash,
                 right_hash=diff.right_hash,
+                visible_equivalent=diff.visible_equivalent,
+                runtime_equivalent=diff.runtime_equivalent,
+                continuation_checks_passed=diff.continuation_checks_passed,
                 changed_ids=tuple(mismatch.key for mismatch in diff.mismatches),
                 reason="equal" if diff.equivalent else "canonical state differs",
             ),

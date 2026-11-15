@@ -41,6 +41,11 @@ class SourceEvent:
     content: str
     timestamp: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # These fields are part of the input contract, not optional presentation
+    # metadata.  Keeping them explicit prevents dataset adapters from silently
+    # collapsing assistant/other-speaker turns into the default ``user`` role.
+    speaker: str | None = None
+    session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,19 +74,21 @@ class BuildCost:
     generated_objects: int = 0
     state_records: int = 0
     llm_calls: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    embedding_calls: int = 0
-    embedding_items: int = 0
+    # Provider usage is optional.  ``None`` means the boundary did not expose
+    # a measurement; it must not be rendered as a measured zero.
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    embedding_calls: int | None = None
+    embedding_items: int | None = None
     index_updates: int = 0
     memory_reads: int = 0
     bytes_read: int = 0
     bytes_written: int = 0
     wall_time_ms: float = 0.0
     peak_memory_mb: float | None = None
-    # ``replayed_events`` is the total number of events actually executed by
-    # the arm.  Prefix/suffix counters make the accounting auditable when a
-    # nominal "suffix replay" first reconstructs a prefix.
+    # ``replayed_events`` is the number of events actually executed by the
+    # arm. Prefix/suffix counters make checkpoint replay auditable; a restored
+    # prefix has zero replayed events and its restore work is charged below.
     prefix_replayed_events: int = 0
     suffix_replayed_events: int = 0
     checkpoint_restore_events: int = 0
@@ -107,6 +114,9 @@ class StateComparison:
     equal: bool
     left_hash: str
     right_hash: str
+    visible_equivalent: bool | None = None
+    runtime_equivalent: bool | None = None
+    continuation_checks_passed: bool | None = None
     missing_ids: tuple[str, ...] = ()
     extra_ids: tuple[str, ...] = ()
     changed_ids: tuple[str, ...] = ()
@@ -304,6 +314,7 @@ class DeterministicMemoryBuilder:
                     "replay_start": start,
                     "dependency_baseline": "materialized_read_control_set",
                     "m3_status": "implemented_conservative_exact_reference",
+                    "m3_scope": "deterministic_fixture_only",
                 }
             )
             return result
@@ -410,10 +421,13 @@ def run_all_arms(
     builder = builder or DeterministicMemoryBuilder()
     deleted = set(deleted_ids)
     reference = builder.run_arm(events, deleted, MaintenanceArm.M0_FULL_REBUILD)
+    reference_repeat = builder.run_arm(events, deleted, MaintenanceArm.M0_FULL_REBUILD)
+    common_baseline = builder.build(events)
     output: dict[MaintenanceArm, tuple[BuildResult, StateComparison]] = {}
     for arm in MaintenanceArm:
         result = reference if arm is MaintenanceArm.M0_FULL_REBUILD else builder.run_arm(
-            events, deleted, arm, baseline=builder.build(events)
+            events, deleted, arm, baseline=common_baseline
         )
-        output[arm] = (result, compare_snapshots(result.snapshot, reference.snapshot))
+        target = reference_repeat if arm is MaintenanceArm.M0_FULL_REBUILD else reference
+        output[arm] = (result, compare_snapshots(result.snapshot, target.snapshot))
     return output

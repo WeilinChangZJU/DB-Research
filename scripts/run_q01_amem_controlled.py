@@ -236,7 +236,6 @@ def main() -> int:
     if args.resume:
         cost.load_existing()
     trace = TraceRecorder(args.out / "trace.jsonl")
-    llm = ScriptedOfficialLLM()
     embedder = HashEmbedder()
 
     for instance in histories:
@@ -246,7 +245,7 @@ def main() -> int:
 
         def factory() -> AmemAdapter:
             return AmemAdapter(
-                llm,
+                ScriptedOfficialLLM(),
                 repo_path=OFFICIAL_REPO,
                 embedder=embedder,
                 retrieve_k=args.retrieve_k,
@@ -259,6 +258,12 @@ def main() -> int:
             factory,
             retrieve_k=args.retrieve_k,
             trace=trace,
+            trace_context={
+                "instance_id": instance["instance_id"],
+                "base_instance_id": instance.get("base_instance_id", instance["instance_id"]),
+                "scenario_id": instance["instance_id"],
+                "selection": instance.get("selection", {}),
+            },
         )
         # Probe the actual serving path after maintenance.  The question is a
         # hash-stable snippet of the deleted event, so the probe can detect
@@ -283,13 +288,20 @@ def main() -> int:
         }
         query_probes: dict[str, dict[str, Any]] = {}
         for arm, (result, _comparison) in outputs.items():
-            adapter_llm = getattr(result.wrapper.adapter, "llm", None)
+            query_isolated = False
+            try:
+                probe_wrapper = result.wrapper.fork(trace=trace)
+                probe_wrapper.set_trace_context(phase="query_probe")
+                query_isolated = True
+            except Exception:
+                probe_wrapper = result.wrapper
+            adapter_llm = getattr(probe_wrapper.adapter, "llm", None)
             before_llm = int(getattr(adapter_llm, "calls", 0) or 0)
-            adapter_embedder = getattr(result.wrapper.adapter, "embedder", None)
+            adapter_embedder = getattr(probe_wrapper.adapter, "embedder", None)
             before_embed_calls = int(getattr(adapter_embedder, "calls", 0) or 0)
             before_embed_items = int(getattr(adapter_embedder, "items", 0) or 0)
             started = time.perf_counter()
-            probe = result.wrapper.query(question)
+            probe = probe_wrapper.query(question)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             after_llm = int(getattr(adapter_llm, "calls", 0) or 0)
             after_embed_calls = int(getattr(adapter_embedder, "calls", 0) or 0)
@@ -308,6 +320,8 @@ def main() -> int:
                 "context_source_ids": list(details.get("context_source_ids", [])),
                 "evidence_complete": bool(details.get("evidence_complete", False)),
                 "deleted_source_exposed": deleted_exposed,
+                "query_isolated": query_isolated,
+                "answer_sha256": hashlib.sha256(str(probe.answer).encode("utf-8")).hexdigest(),
             }
             cost.record(
                 "query_probe",
@@ -324,6 +338,7 @@ def main() -> int:
                 query_sha256=query_probes[arm.value]["question_sha256"],
                 deleted_source_exposed=deleted_exposed,
                 evidence_complete=bool(details.get("evidence_complete", False)),
+                query_isolated=query_isolated,
             )
         summary = _summary(
             instance,
@@ -346,6 +361,29 @@ def main() -> int:
                     exact_to_reference=None,
                     phase="baseline_setup",
                 )
+        shared_baseline = next(
+            (
+                result.metadata.get("shared_baseline_cost")
+                for result, _comparison in outputs.values()
+                if isinstance(result.metadata.get("shared_baseline_cost"), dict)
+            ),
+            None,
+        )
+        if shared_baseline is not None:
+            cost.record_arm_cost(
+                arm="shared_baseline",
+                cost=SimpleNamespace(**shared_baseline),
+                exact_to_reference=None,
+                phase="common_baseline",
+            )
+        reference_repeat = outputs[MaintenanceArm.M0_FULL_REBUILD][0].metadata.get("reference_repeat_cost")
+        if isinstance(reference_repeat, dict):
+            cost.record_arm_cost(
+                arm="reference_repeat",
+                cost=SimpleNamespace(**reference_repeat),
+                exact_to_reference=None,
+                phase="reference_repeat",
+            )
         trace.record(
             "q01_instance_complete",
             instance_id=instance_id,

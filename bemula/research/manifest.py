@@ -35,7 +35,16 @@ def sha256_tree(root: str | Path, *, exclude: Iterable[str] = ()) -> str:
     is included before the file bytes so renaming a file changes the digest.
     """
     root = Path(root)
-    excluded = {Path(item).as_posix() for item in exclude}
+    # Results are often written below names such as ``experiment_results`` or
+    # ``q01_runs``.  Treat these well-known output/cache directories as
+    # excluded by basename as well as honoring caller-provided paths, so a
+    # run fingerprint cannot change merely because a receipt was emitted.
+    default_excluded_names = {
+        ".git", ".venv", "__pycache__", ".pytest_cache", "results",
+        "experiment_results", "experiment_results_20261114", "q01_runs",
+        "q01_inputs", "q01_freeze", "logs",
+    }
+    excluded = {Path(item).as_posix() for item in exclude} | default_excluded_names
     digest = hashlib.sha256()
     if root.is_file():
         return sha256_file(root)
@@ -43,7 +52,10 @@ def sha256_tree(root: str | Path, *, exclude: Iterable[str] = ()) -> str:
         return "missing"
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         rel = path.relative_to(root).as_posix()
-        if rel in excluded or any(rel.startswith(prefix.rstrip("/") + "/") for prefix in excluded):
+        parts = rel.split("/")
+        if any(part in default_excluded_names for part in parts[:-1]):
+            continue
+        if rel in excluded or any(rel.startswith(prefix.rstrip("/") + "/") for prefix in excluded if "/" in prefix or prefix not in default_excluded_names):
             continue
         digest.update(rel.encode("utf-8"))
         digest.update(b"\0")

@@ -122,7 +122,12 @@ def test_snapshot_detects_embedding_value_change():
     before = wrapper.canonical_snapshot()
     wrapper._system().retriever.embeddings[:] = np.array([[0.,1.]])
     after = wrapper.canonical_snapshot()
-    assert not CanonicalStateComparator().compare(before,after).equivalent
+    diff = CanonicalStateComparator().compare(before, after)
+    # The default oracle is the visible-state contract.  Runtime index values
+    # are reported separately because an implementation may use a different
+    # physical layout while preserving visible semantics.
+    assert diff.visible_equivalent
+    assert diff.runtime_equivalent is False
 
 def test_snapshot_detects_consolidation_counter_change():
     wrapper = AmemResearchWrapper(Adapter())
@@ -131,7 +136,9 @@ def test_snapshot_detects_consolidation_counter_change():
     before = wrapper.canonical_snapshot()
     wrapper._system().evo_cnt = 99
     after = wrapper.canonical_snapshot()
-    assert not CanonicalStateComparator().compare(before,after).equivalent
+    diff = CanonicalStateComparator().compare(before, after)
+    assert diff.visible_equivalent
+    assert diff.runtime_equivalent is False
 
 def test_old_source_exposure_includes_read_set():
     left=QueryResult(answer='same',evidence=QueryEvidence(source_ids=[],read_set=['deleted']))
