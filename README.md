@@ -12,14 +12,16 @@ commit, environment variables, external dataset boundary, explicit deletion
 history generation, focused real-model pilot, serial runner, output contract,
 full-cost accounting, and interpretation limits.
 
-Current research status: the earlier focused real-provider pilot remains
-`PROMISING / UNVERIFIED` and is retained only as bounded execution evidence.
-The current source has since been repaired so that M0 uses an independent
-repeat, M1--M3 share one forkable baseline, M2/M3 use runtime checkpoints
-instead of hidden prefix re-ingestion, and visible/runtime comparison layers
-are reported separately. Canonical identity preserves source/time/origin
-distinctions and ordered retrieval links; physical UUIDs are excluded from
-query evidence signatures. The formal runner defaults to
+Current research status: **PROMISING / UNVERIFIED; the platform repair gate
+passes, but the post-repair real-model scientific gate is still open**. The
+current source uses an independent cassette-backed M0 repeat, explicit
+temperature/replay/seed freeze fields, stable logical origins independent of
+physical UUID ordering, and hash-checked structured final-context lineage.
+M1--M3 share one forkable baseline, M2/M3 use runtime checkpoints instead of
+hidden prefix re-ingestion, and visible/runtime comparison layers are reported
+separately. Canonical identity preserves source/time/origin distinctions and
+ordered retrieval links; physical UUIDs are excluded from query evidence
+signatures. The formal runner defaults to
 `m3_mode=conservative_full`, which replays the complete retained history as a
 conservative correctness baseline. `m3_mode=materialized` is a limited
 diagnostic policy, while `m3_mode=recheck` is a generic re-evaluation policy
@@ -28,6 +30,9 @@ optimal dependency algorithm. The latest bounded real-model pilot review is in
 [docs/Q01_PILOT_REVIEW_20261115.md](docs/Q01_PILOT_REVIEW_20261115.md), and
 third-audit repairs are recorded in
 [docs/Q01_THIRD_AUDIT_REPAIR_20261115.md](docs/Q01_THIRD_AUDIT_REPAIR_20261115.md).
+The current M0 repeat, lineage repair, controlled verification, and blocked
+real-provider pilot are recorded in
+[docs/Q01_REPEAT_LINEAGE_REPAIR_20261115.md](docs/Q01_REPEAT_LINEAGE_REPAIR_20261115.md).
 
 ## Setup
 

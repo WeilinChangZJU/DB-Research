@@ -20,6 +20,11 @@ exposes the forward and reverse dependency maps and the trace quality. Query
 evidence signatures use a UUID-invariant source payload; when the final
 rendered context cannot be mapped to sources without ambiguity, evidence is
 explicitly incomplete rather than treated as exact.
+For the pinned robust A-MEM renderer, the wrapper also reconstructs the
+ordered seed-plus-link-neighbor segments and verifies their concatenated hash
+against the returned context. Verified segments carry only role and source
+IDs in the durable evidence record, so duplicate text and hidden neighbor
+expansion cannot silently bypass lineage accounting.
 
 The trace is explicitly labelled `wrapper_delta`. The stock adapter does not
 expose its parsed branch as a stable public API, so the wrapper's branch labels

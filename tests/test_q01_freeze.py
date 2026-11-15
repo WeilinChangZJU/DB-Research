@@ -3,7 +3,11 @@ import json
 
 from bemula.research.manifest import sha256_tree
 from scripts.build_q01_amem_freeze import build_freeze
-from scripts.run_q01_amem_paired import _load_histories, _validate_histories
+from scripts.run_q01_amem_paired import (
+    _frozen_runtime_config,
+    _load_histories,
+    _validate_histories,
+)
 from scripts.run_q01_amem_formal import _resolve_amem_path, _source_tree_files_only, _verify_freeze
 
 
@@ -100,6 +104,37 @@ def test_freeze_builder_records_commit_and_input_hashes(tmp_path: Path, monkeypa
     assert receipt["official_amem"]["commit"] == "abc123"
     assert receipt["inputs"]["locomo"]["sha256"]
     assert receipt["model_config"]["local_embedding_variant"]["model"].endswith("all-MiniLM-L6-v2")
+    assert receipt["model_config"]["amem_temperature"] == 0.0
+    assert receipt["model_config"]["provider_replay_policy"] == (
+        "m0_repeat_request_key_cassette"
+    )
+    assert receipt["model_config"]["random_seed"] is None
+
+
+def test_paired_runner_fingerprint_pins_cassette_runtime(monkeypatch):
+    monkeypatch.delenv("BEMULA_AMEM_TEMPERATURE", raising=False)
+    monkeypatch.delenv("BEMULA_PROVIDER_REPLAY_POLICY", raising=False)
+    monkeypatch.delenv("BEMULA_RANDOM_SEED", raising=False)
+    assert _frozen_runtime_config() == {
+        "amem_temperature": 0.0,
+        "provider_replay_policy": "m0_repeat_request_key_cassette",
+        "m0_repeat_cassette_backed": True,
+        "random_seed": None,
+    }
+
+    monkeypatch.setenv("BEMULA_AMEM_TEMPERATURE", "0.0")
+    monkeypatch.setenv("BEMULA_RANDOM_SEED", "17")
+    pinned = _frozen_runtime_config()
+    assert pinned["random_seed"] == 17
+    assert pinned["m0_repeat_cassette_backed"] is True
+
+    monkeypatch.setenv("BEMULA_PROVIDER_REPLAY_POLICY", "none")
+    try:
+        _frozen_runtime_config()
+    except ValueError as exc:
+        assert "provider replay policy" in str(exc)
+    else:
+        raise AssertionError("non-cassette M0 policy must be rejected")
 
 
 def test_formal_freeze_verifies_optional_runtime_model_settings(tmp_path: Path, monkeypatch):

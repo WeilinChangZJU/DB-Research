@@ -70,7 +70,15 @@ class _AmemLLM:
         self._llm = llm
         self.last_usage: dict[str, Any] = {}
 
-    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+    def get_completion(self, prompt: str, temperature: float | None = None) -> str:
+        # The official robust A-MEM layer omits ``temperature`` for its
+        # normal metadata/evolution calls, which otherwise falls back to its
+        # stochastic 0.7 default.  Q01 freezes this setting explicitly so
+        # the reference builder has a declared execution semantics.  The
+        # official retry path still passes its own temperature (currently
+        # 0.3) and is preserved.
+        if temperature is None:
+            temperature = float(os.environ.get("BEMULA_AMEM_TEMPERATURE", "0.0"))
         result = self._llm.chat(
             [{"role": "user", "content": prompt}],
             temperature=temperature,

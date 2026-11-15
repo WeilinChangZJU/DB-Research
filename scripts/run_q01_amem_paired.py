@@ -40,6 +40,38 @@ from bemula.research import (
 from scripts.run_eval import _build_baseline
 
 
+M0_REPEAT_PROVIDER_REPLAY_POLICY = "m0_repeat_request_key_cassette"
+
+
+def _frozen_runtime_config() -> dict[str, Any]:
+    """Return the non-secret runtime settings pinned in a paired run.
+
+    The paired runner always uses the request-key cassette for its independent
+    M0 repeat.  Rejecting a different policy here prevents a run from being
+    labelled cassette-backed while silently using stochastic provider calls.
+    """
+
+    amem_temperature = float(os.environ.get("BEMULA_AMEM_TEMPERATURE", "0.0"))
+    if not (amem_temperature >= 0.0 and amem_temperature != float("inf")):
+        raise ValueError("BEMULA_AMEM_TEMPERATURE must be a finite non-negative number")
+    provider_replay_policy = os.environ.get(
+        "BEMULA_PROVIDER_REPLAY_POLICY", M0_REPEAT_PROVIDER_REPLAY_POLICY
+    )
+    if provider_replay_policy != M0_REPEAT_PROVIDER_REPLAY_POLICY:
+        raise ValueError(
+            "run_q01_amem_paired requires provider replay policy "
+            f"{M0_REPEAT_PROVIDER_REPLAY_POLICY!r}; got {provider_replay_policy!r}"
+        )
+    random_seed_value = os.environ.get("BEMULA_RANDOM_SEED")
+    random_seed = int(random_seed_value) if random_seed_value not in (None, "") else None
+    return {
+        "amem_temperature": amem_temperature,
+        "provider_replay_policy": provider_replay_policy,
+        "m0_repeat_cassette_backed": True,
+        "random_seed": random_seed,
+    }
+
+
 def _iter_histories(path: Path):
     # Iterate the JSONL stream instead of read_text().splitlines().  The full
     # LongMemEval-S input is hundreds of megabytes, and duplicating it as a
@@ -162,6 +194,42 @@ def _summary(
             },
             "query_probe": query_probe,
         }
+    # M0's repeat is the independent rebuild used to validate the state
+    # oracle.  It is deliberately exposed at instance-summary level so a
+    # reviewer can distinguish cassette-backed repeatability from an
+    # independent stochastic provider trial without opening arm internals.
+    m0_result = outputs.get(MaintenanceArm.M0_FULL_REBUILD)
+    m0_metadata = (
+        dict(m0_result[0].metadata)
+        if m0_result is not None and isinstance(m0_result[0].metadata, dict)
+        else {}
+    )
+    m0_repeat = {
+        "provider_replay_policy": m0_metadata.get(
+            "reference_repeat_provider_replay_policy"
+        ),
+        "cassette_backed": bool(
+            m0_metadata.get("reference_repeat_cassette_backed", False)
+        ),
+        "cache_hits": int(
+            m0_metadata.get(
+                "reference_repeat_cache_hits",
+                m0_metadata.get("reference_repeat_provider_cache_hits", 0),
+            )
+            or 0
+        ),
+        "cache_misses": int(
+            m0_metadata.get(
+                "reference_repeat_cache_misses",
+                m0_metadata.get("reference_repeat_provider_cache_misses", 0),
+            )
+            or 0
+        ),
+        "replay_complete": bool(
+            m0_metadata.get("reference_repeat_provider_replay_complete", False)
+        ),
+        "cost": m0_metadata.get("reference_repeat_cost"),
+    }
     return {
         "schema_version": 2,
         "instance_id": instance["instance_id"],
@@ -171,6 +239,15 @@ def _summary(
         "mask_policy": instance.get("mask_policy"),
         "deleted_source_ids": list(instance["deleted_source_ids"]),
         "arms": arms,
+        "m0_repeat": m0_repeat,
+        # Flat aliases are retained for JSONL/SQL consumers that do not
+        # materialize nested objects.  They also make cache accounting easy
+        # to audit alongside the paired arm costs.
+        "m0_repeat_provider_replay_policy": m0_repeat["provider_replay_policy"],
+        "m0_repeat_cassette_backed": m0_repeat["cassette_backed"],
+        "m0_repeat_cache_hits": m0_repeat["cache_hits"],
+        "m0_repeat_cache_misses": m0_repeat["cache_misses"],
+        "m0_repeat_replay_complete": m0_repeat["replay_complete"],
         "reference_query_probe": query_probes.get("M0_reference_repeat"),
     }
 
@@ -188,6 +265,7 @@ def _canonical_evidence_payload(evidence: Any, details: dict[str, Any]) -> dict[
         "raw_context_hash",
         "raw_context_chars",
         "context_source_ids",
+        "context_segment_sources",
         "context_coverage",
         "context_coverage_ratio",
         "lineage_coverage",
@@ -199,6 +277,16 @@ def _canonical_evidence_payload(evidence: Any, details: dict[str, Any]) -> dict[
         "answer_retrieval_is_best_effort",
     )
     stable_details: dict[str, Any] = {}
+    segments = details.get("context_segments", [])
+    if isinstance(segments, list):
+        stable_details["context_segment_sources"] = [
+            {
+                "role": str(segment.get("role", "")),
+                "source_ids": sorted({str(source) for source in segment.get("source_ids", [])}),
+            }
+            for segment in segments
+            if isinstance(segment, dict)
+        ]
     for key in stable_detail_keys:
         value = details.get(key)
         if key.endswith("_ids") and isinstance(value, (list, tuple, set)):
@@ -272,6 +360,7 @@ def _probe_query(
             "raw_context_hash",
             "raw_context_chars",
             "context_source_ids",
+            "context_segment_sources",
             "context_coverage",
             "context_coverage_ratio",
             "lineage_coverage",
@@ -283,6 +372,16 @@ def _probe_query(
             "answer_retrieval_is_best_effort",
         )
         stable_details = {}
+        segments = details.get("context_segments", [])
+        if isinstance(segments, list):
+            stable_details["context_segment_sources"] = [
+                {
+                    "role": str(segment.get("role", "")),
+                    "source_ids": sorted({str(source) for source in segment.get("source_ids", [])}),
+                }
+                for segment in segments
+                if isinstance(segment, dict)
+            ]
         for key in stable_detail_keys:
             value = details.get(key)
             if key.endswith("_ids") and isinstance(value, (list, tuple, set)):
@@ -308,6 +407,8 @@ def _probe_query(
         "selected_ids": list(details.get("selected_ids", [])),
         "context_object_ids": list(details.get("read_object_ids", [])),
         "context_source_ids": list(details.get("context_source_ids", [])),
+        "context_segments": list(details.get("context_segments", [])),
+        "context_segments_complete": bool(details.get("context_segments_complete", False)),
         "evidence_complete": bool(details.get("evidence_complete", False)),
         "deleted_source_exposed": deleted_exposed,
         "llm_calls": len(llm_events),
@@ -379,6 +480,7 @@ def main() -> int:
     ).resolve()
     store = CheckpointStore(args.out)
     tree_digest = sha256_tree(root, exclude=(".venv", ".git", "results"))
+    runtime_config = _frozen_runtime_config()
     fingerprint = {
         "schema_version": 1,
         "runner": "run_q01_amem_paired",
@@ -397,6 +499,7 @@ def main() -> int:
             "BEMULA_AMEM_SOURCE_TREE_SHA256"
         ),
         "model_config_sha256": os.environ.get("BEMULA_MODEL_CONFIG_SHA256"),
+        **runtime_config,
     }
     store.ensure_fingerprint(fingerprint)
     done = store.completed_ids(validate=True) if args.resume else set()

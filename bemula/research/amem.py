@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import copy
 import json
+from numbers import Integral
 import re
 import time
 from contextlib import contextmanager
@@ -99,10 +100,21 @@ class AmemResearchWrapper(MemoryBackend):
 
     name = "amem-research-wrapper"
 
-    def __init__(self, adapter: MemoryAdapter, *, retrieve_k: int = 10, trace: Any | None = None):
+    def __init__(
+        self,
+        adapter: MemoryAdapter,
+        *,
+        retrieve_k: int = 10,
+        trace: Any | None = None,
+        response_cache: dict[str, str] | None = None,
+    ):
         self.adapter = adapter
         self.retrieve_k = retrieve_k
         self.trace = trace
+        # A shared request-key cache is used only when a caller explicitly
+        # freezes provider responses across independent builds (for example,
+        # the M0 repeat oracle). Normal wrappers keep a private cache.
+        self._shared_response_cache = response_cache
         self.reset()
 
     def reset(self) -> None:
@@ -122,7 +134,11 @@ class AmemResearchWrapper(MemoryBackend):
         # Request-keyed provider responses are copied with a runtime fork.
         # Recheck policies may reuse an unchanged response, but always execute
         # the current write logic against the restored state.
-        self._response_cache: dict[str, str] = {}
+        self._response_cache: dict[str, str] = (
+            self._shared_response_cache
+            if self._shared_response_cache is not None
+            else {}
+        )
         # Physical object IDs can be updated in place by A-MEM.  Keep the
         # version visible in dependency traces so an update reads the old
         # version and writes a new one instead of creating a self-cycle.
@@ -175,6 +191,7 @@ class AmemResearchWrapper(MemoryBackend):
         clone._trace_context = copy.deepcopy(self._trace_context)
         clone._checkpoints = {}
         clone._provider_fork_mode = getattr(adapter, "provider_fork_mode", "unknown")
+        clone._shared_response_cache = None
         return clone
 
     def _save_checkpoint(self, event_count: int) -> None:
@@ -533,8 +550,11 @@ class AmemResearchWrapper(MemoryBackend):
             "scores_available": False,
             "raw_context_hash": None,
             "raw_context_chars": None,
+            "context_k": self.retrieve_k,
             "context_object_ids": [],
             "context_source_ids": [],
+            "context_segments": [],
+            "context_segments_complete": False,
             "context_mapping_complete": False,
             "context_coverage": False,
             "context_coverage_ratio": 0.0,
@@ -633,6 +653,117 @@ class AmemResearchWrapper(MemoryBackend):
             captured["lineage_ambiguous"] = bool(ambiguous_note_ids)
             captured["unmapped_context_hash"] = _hash_text(unknown_text) if unknown_text else None
 
+        def structured_context_segments(indices: Any, k: int) -> tuple[list[dict[str, Any]], str]:
+            """Reconstruct the pinned robust A-MEM renderer with source labels.
+
+            The official robust implementation expands each retrieved seed by
+            its ordered integer ``links`` and renders a fixed concatenation of
+            note fields.  Reconstructing that same string lets us verify the
+            mapping against the actual returned context hash.  If an adapter
+            uses a different renderer, the hash check fails and the wrapper
+            deliberately falls back to the conservative text-only path.
+            """
+
+            memories = self._memories()
+            note_ids = list(memories)
+            segments: list[dict[str, Any]] = []
+            rendered_parts: list[str] = []
+
+            def add_segment(note_id: str, role: str, parent: str | None = None) -> None:
+                note = memories[note_id]
+                timestamp = str(getattr(note, "timestamp", ""))
+                content = self._note_content(note)
+                context = str(getattr(note, "context", ""))
+                keywords = _as_list(getattr(note, "keywords", []))
+                tags = _as_list(getattr(note, "tags", []))
+                rendered_parts.append(
+                    "talk start time:" + timestamp
+                    + "memory content: " + content
+                    + "memory context: " + context
+                    + "memory keywords: " + str(keywords)
+                    + "memory tags: " + str(tags) + "\n"
+                )
+                segments.append(
+                    {
+                        "object_id": note_id,
+                        "role": role,
+                        "parent_object_id": parent,
+                        "source_ids": sorted(self._object_support.get(note_id, set())),
+                    }
+                )
+
+            for raw_index in _as_sequence(indices):
+                try:
+                    index = int(raw_index)
+                except (TypeError, ValueError):
+                    continue
+                if not 0 <= index < len(note_ids):
+                    continue
+                seed_id = note_ids[index]
+                add_segment(seed_id, "seed")
+                raw_links = getattr(memories[seed_id], "links", [])
+                for position, raw_neighbor in enumerate(_as_sequence(raw_links)):
+                    # The pinned official implementation accepts Python ints
+                    # and numpy integer scalars, while explicitly rejecting
+                    # bool (which is an ``int`` subclass).  ``Integral``
+                    # mirrors that contract without importing numpy into the
+                    # core wrapper.
+                    if isinstance(raw_neighbor, bool) or not isinstance(raw_neighbor, Integral):
+                        continue
+                    neighbor_index = int(raw_neighbor)
+                    if not 0 <= neighbor_index < len(note_ids):
+                        continue
+                    neighbor_id = note_ids[neighbor_index]
+                    add_segment(neighbor_id, "neighbor", seed_id)
+                    # This mirrors memory_layer_robust.find_related_memories_raw:
+                    # append first, then stop once the k-th neighbor is emitted.
+                    if position >= k:
+                        break
+            return segments, "".join(rendered_parts)
+
+        def map_structured_context(rendered: str) -> None:
+            """Prefer verified structured segments over text reverse lookup."""
+
+            segments, expected = structured_context_segments(
+                captured.get("indices", []), int(captured.get("context_k", self.retrieve_k))
+            )
+            if not segments:
+                # An empty raw context is fully observed: there are no
+                # fragments to attribute, and the renderer hash certifies
+                # that the adapter injected nothing.  This is distinct from
+                # an unavailable raw finder, which remains incomplete.
+                if captured.get("raw_context_hash") == _hash_text(""):
+                    captured["context_segments"] = []
+                    captured["context_segments_complete"] = True
+                    captured["context_object_ids"] = []
+                    captured["context_source_ids"] = []
+                    captured["context_mapping_complete"] = True
+                    captured["context_coverage"] = True
+                    captured["context_coverage_ratio"] = 1.0
+                    captured["lineage_coverage"] = True
+                    captured["lineage_ambiguous"] = False
+                    captured["unmapped_context_hash"] = None
+                return
+            if _hash_text(expected) != captured.get("raw_context_hash"):
+                return
+            context_ids = [str(segment["object_id"]) for segment in segments]
+            source_ids = sorted({
+                str(source)
+                for segment in segments
+                for source in segment.get("source_ids", [])
+            })
+            lineage_complete = all(bool(segment.get("source_ids")) for segment in segments)
+            captured["context_segments"] = segments
+            captured["context_segments_complete"] = True
+            captured["context_object_ids"] = list(dict.fromkeys(context_ids))
+            captured["context_source_ids"] = source_ids
+            captured["context_mapping_complete"] = lineage_complete
+            captured["context_coverage"] = True
+            captured["context_coverage_ratio"] = 1.0
+            captured["lineage_coverage"] = lineage_complete
+            captured["lineage_ambiguous"] = False
+            captured["unmapped_context_hash"] = None
+
         def score_indices(query: str, indices: Any) -> None:
             try:
                 model = getattr(retriever, "model", None)
@@ -666,11 +797,13 @@ class AmemResearchWrapper(MemoryBackend):
         raw_finder = getattr(system, "find_related_memories_raw", None)
 
         def wrapped_raw(query: str, k: int = self.retrieve_k, *args: Any, **kwargs: Any) -> Any:
+            captured["context_k"] = int(k)
             result = raw_finder(query, k, *args, **kwargs)
             rendered = str(result)
             captured["raw_context_hash"] = _hash_text(rendered)
             captured["raw_context_chars"] = len(rendered)
             map_rendered_context(rendered)
+            map_structured_context(rendered)
             return result
 
         if not callable(search):
@@ -821,7 +954,29 @@ class AmemResearchWrapper(MemoryBackend):
         # source support is known. Deriving identity before this update made
         # same-content notes from different source events collapse to one
         # canonical ID, which in turn hid retargeted links.
-        for output_slot, object_id in enumerate(new_ids):
+        # ``new_ids`` is sorted by the physical UUID used by A-MEM.  That
+        # ordering changes across independent rebuilds and used to assign
+        # different logical output slots to otherwise identical notes.  Sort
+        # by semantic record fields before assigning the stable origin; exact
+        # duplicates remain equivalent under the multiset comparator.
+        def logical_output_key(object_id: str) -> tuple[str, ...]:
+            record = after.get(object_id)
+            if record is None:
+                return (object_id,)
+            metadata = dict(record.metadata)
+            metadata.pop("note_id", None)
+            return (
+                record.content,
+                str(record.timestamp or ""),
+                str(record.kind or ""),
+                str(record.version),
+                json.dumps(sorted(record.support_set), ensure_ascii=False),
+                json.dumps(list(record.derived_from), ensure_ascii=False),
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str),
+            )
+
+        logical_new_ids = sorted(new_ids, key=logical_output_key)
+        for output_slot, object_id in enumerate(logical_new_ids):
             record = after.get(object_id)
             if record is not None:
                 self._logical_origins.setdefault(
@@ -1300,17 +1455,24 @@ class AmemHistoryBuilder:
         trace: Any | None = None,
         trace_context: Mapping[str, Any] | None = None,
         m3_mode: str = "materialized",
+        response_cache: dict[str, str] | None = None,
     ):
         self.factory = factory
         self.retrieve_k = retrieve_k
         self.trace = trace
         self.trace_context = dict(trace_context or {})
+        self.response_cache = response_cache
         if m3_mode not in {"materialized", "conservative_full", "recheck"}:
             raise ValueError(f"unknown m3_mode: {m3_mode}")
         self.m3_mode = m3_mode
 
     def _new(self) -> AmemResearchWrapper:
-        wrapper = AmemResearchWrapper(self.factory(), retrieve_k=self.retrieve_k, trace=self.trace)
+        wrapper = AmemResearchWrapper(
+            self.factory(),
+            retrieve_k=self.retrieve_k,
+            trace=self.trace,
+            response_cache=self.response_cache,
+        )
         wrapper.set_trace_context(**self.trace_context)
         return wrapper
 
@@ -1820,8 +1982,24 @@ def run_amem_all_arms(
         reference.cost,
         wall_time_ms=(time.perf_counter() - reference_started) * 1000.0,
     )
+    # The second M0 is an independent runtime, but it must evaluate the same
+    # frozen provider responses when the upstream API does not guarantee
+    # deterministic sampling.  Seed a fresh builder with the first build's
+    # request-key response ledger; this keeps the repeat a real rebuild while
+    # removing provider stochasticity from the state oracle.  The shared
+    # baseline below intentionally uses a separate provider ledger so its
+    # lifecycle cost remains observable.
+    repeat_response_cache = dict(reference.wrapper._response_cache)
+    repeat_builder = AmemHistoryBuilder(
+        factory,
+        retrieve_k=retrieve_k,
+        trace=trace,
+        trace_context=trace_context,
+        m3_mode=m3_mode,
+        response_cache=repeat_response_cache,
+    )
     repeat_started = time.perf_counter()
-    reference_repeat = builder.run_arm(
+    reference_repeat = repeat_builder.run_arm(
         events,
         deleted,
         MaintenanceArm.M0_FULL_REBUILD,
@@ -1856,6 +2034,25 @@ def run_amem_all_arms(
                     "reference_repeat_equal": reference_diff.equivalent,
                     "reference_repeat_visible_equal": reference_diff.visible_equivalent,
                     "reference_repeat_runtime_equal": reference_diff.runtime_equivalent,
+                    # This repeat is a deterministic oracle under a frozen
+                    # request-key response cassette.  It is not an
+                    # independent stochastic provider trial.
+                    "reference_repeat_provider_replay_policy": "m0_repeat_request_key_cassette",
+                    "reference_repeat_cassette_backed": True,
+                    "reference_repeat_provider_replay_complete": (
+                        reference_repeat.cost.llm_calls == reference_repeat.cost.llm_cache_hits
+                    ),
+                    "reference_repeat_provider_cache_hits": reference_repeat.cost.llm_cache_hits,
+                    "reference_repeat_provider_cache_misses": max(
+                        0, reference_repeat.cost.llm_calls - reference_repeat.cost.llm_cache_hits
+                    ),
+                    # Stable short aliases make the result contract easier to
+                    # consume without dropping the provider-prefixed names
+                    # retained for backwards compatibility.
+                    "reference_repeat_cache_hits": reference_repeat.cost.llm_cache_hits,
+                    "reference_repeat_cache_misses": max(
+                        0, reference_repeat.cost.llm_calls - reference_repeat.cost.llm_cache_hits
+                    ),
                     "reference_repeat_hash": reference_repeat.wrapper.canonical_hash(
                         dataset="amem", instance_id="fixture"
                     ),

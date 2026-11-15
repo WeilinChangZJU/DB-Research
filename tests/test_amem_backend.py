@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from types import SimpleNamespace
+from uuid import uuid4
 
 import numpy as np
 import pytest
@@ -15,6 +16,7 @@ from bemula.research import (
     run_toy_experiment,
 )
 from bemula.schemas import Turn
+from scripts.run_q01_amem_paired import _summary
 
 
 class _Note:
@@ -83,6 +85,18 @@ class _ScriptedAmemAdapter(_StubAmemAdapter):
     def observe(self, turn: Turn) -> None:
         self._system.llm_controller.llm.get_completion("EVOLUTION DECISION")
         super().observe(turn)
+
+
+class _RandomPhysicalIdSystem(_System):
+    def add_note(self, content: str, time: str = "") -> str:
+        note_id = str(uuid4())
+        self.memories[note_id] = _Note(note_id, content, time)
+        return note_id
+
+
+class _RandomPhysicalIdAmemAdapter(_StubAmemAdapter):
+    def reset(self):
+        self._system = _RandomPhysicalIdSystem()
 
 
 class _QueryUsageAmemAdapter(_StubAmemAdapter):
@@ -189,6 +203,64 @@ def test_amem_paired_arms_share_one_baseline_and_m0_is_independent_repeat():
     for arm in (MaintenanceArm.M1_TOMBSTONE, MaintenanceArm.M2_REPLAY, MaintenanceArm.M3_READ_SET):
         assert results[arm][0].metadata["shared_baseline"] is True
         assert "shared_baseline_cost" in results[arm][0].metadata
+
+
+def test_m0_repeat_reuses_frozen_request_responses_across_independent_builds():
+    events = [
+        SourceEvent("e0", "src-a", "alpha", timestamp="t0"),
+        SourceEvent("e1", "src-b", "beta", timestamp="t1"),
+    ]
+    results = run_amem_all_arms(events, ["src-b"], _ScriptedAmemAdapter)
+    m0 = results[MaintenanceArm.M0_FULL_REBUILD][0]
+    repeat_cost = m0.metadata["reference_repeat_cost"]
+    assert m0.metadata["reference_repeat_equal"] is True
+    assert repeat_cost["llm_cache_hits"] == repeat_cost["llm_calls"]
+
+
+def test_m0_repeat_normalizes_random_physical_note_ids():
+    events = [
+        SourceEvent("e0", "src-a", "alpha", timestamp="t0"),
+        SourceEvent("e1", "src-b", "beta", timestamp="t1"),
+        SourceEvent("e2", "src-c", "gamma", timestamp="t2"),
+    ]
+    results = run_amem_all_arms(events, ["src-c"], _RandomPhysicalIdAmemAdapter)
+    m0, comparison = results[MaintenanceArm.M0_FULL_REBUILD]
+    repeat_cost = m0.metadata["reference_repeat_cost"]
+    assert m0.metadata["reference_repeat_provider_replay_complete"] is True
+    assert m0.metadata["reference_repeat_equal"] is True
+    assert comparison.equal is True
+    assert m0.metadata["reference_repeat_provider_replay_policy"] == (
+        "m0_repeat_request_key_cassette"
+    )
+    assert m0.metadata["reference_repeat_cassette_backed"] is True
+    assert m0.metadata["reference_repeat_cache_hits"] == repeat_cost["llm_cache_hits"]
+    assert m0.metadata["reference_repeat_cache_misses"] == 0
+
+    canonical = {
+        arm.value: result.wrapper.canonical_snapshot(
+            dataset="amem", instance_id="h0"
+        )
+        for arm, (result, _comparison) in results.items()
+    }
+    summary = _summary(
+        {
+            "instance_id": "h0",
+            "base_instance_id": "h0",
+            "dataset": "fixture",
+            "selection": {},
+            "mask_policy": "explicit",
+            "deleted_source_ids": ["src-b"],
+        },
+        results,
+        canonical_snapshots=canonical,
+        query_probes={},
+    )
+    assert summary["m0_repeat"]["cassette_backed"] is True
+    assert summary["m0_repeat"]["provider_replay_policy"] == (
+        "m0_repeat_request_key_cassette"
+    )
+    assert summary["m0_repeat_cache_hits"] == repeat_cost["llm_cache_hits"]
+    assert summary["m0_repeat_cache_misses"] == 0
 
 
 def test_amem_checkpoint_replay_restores_before_deleted_event_without_prefix_reingest():

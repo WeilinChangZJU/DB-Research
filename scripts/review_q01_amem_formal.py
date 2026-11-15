@@ -225,6 +225,9 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                             "arm": arm,
                             "question_id": record.get("question_id"),
                             "evidence_complete": bool(record.get("evidence_complete", False)),
+                            "context_segments_complete": bool(
+                                record.get("context_segments_complete", False)
+                            ),
                             "deleted_source_exposed": bool(record.get("deleted_source_exposed", False)),
                             "read_count": len(record.get("read_set", [])),
                             "candidate_count": len(record.get("candidate_ids", [])),
@@ -256,6 +259,9 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                     "instance_id": row.get("instance_id"),
                     "arm": arm,
                     "evidence_complete": evidence_complete,
+                    "context_segments_complete": bool(
+                        probe.get("context_segments_complete", False)
+                    ),
                     "deleted_source_exposed": deleted_exposed,
                     "read_count": read_count,
                     "candidate_count": candidate_count,
@@ -295,6 +301,20 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
         row_contracts.append(
             {
                 "m0_repeat": m0_metadata.get("reference_repeat_equal") is True,
+                "m0_repeat_provider_replay": (
+                    m0_metadata.get("reference_repeat_provider_replay_policy")
+                    == "m0_repeat_request_key_cassette"
+                    and m0_metadata.get("reference_repeat_cassette_backed") is True
+                    and m0_metadata.get("reference_repeat_provider_replay_complete") is True
+                    and int(
+                        m0_metadata.get(
+                            "reference_repeat_cache_misses",
+                            m0_metadata.get("reference_repeat_provider_cache_misses", 0),
+                        )
+                        or 0
+                    )
+                    == 0
+                ),
                 "shared_baseline": all(
                     metadata.get("shared_baseline") is True
                     for metadata in (m1_metadata, m2_metadata, m3_metadata)
@@ -320,14 +340,29 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                     )
                 ),
                 "query_probe_present": query_present,
+                "context_lineage_complete": all(
+                    bool(record.get("context_segments_complete", False))
+                    for arm_name in ARMS
+                    for record in (
+                        arms.get(arm_name, {}).get("query_probe", {}).get("records", [])
+                        if isinstance(arms.get(arm_name, {}).get("query_probe"), dict)
+                        else []
+                    )
+                ),
             }
         )
     execution_contract = {
         "all_m0_repeats_verified": bool(row_contracts) and all(item["m0_repeat"] for item in row_contracts),
+        "all_m0_repeat_provider_replays_verified": bool(row_contracts) and all(
+            item["m0_repeat_provider_replay"] for item in row_contracts
+        ),
         "all_shared_baselines_verified": bool(row_contracts) and all(item["shared_baseline"] for item in row_contracts),
         "all_checkpoint_replays_verified": bool(row_contracts) and all(item["checkpoint_replay"] for item in row_contracts),
         "all_m3_strong_policies_verified": bool(row_contracts) and all(item["m3_strong_policy"] for item in row_contracts),
         "all_query_probes_present": bool(row_contracts) and all(item["query_probe_present"] for item in row_contracts),
+        "all_context_lineage_verified": bool(row_contracts) and all(
+            item["context_lineage_complete"] for item in row_contracts
+        ),
         "lifecycle_scopes_present": bool(shared_components.get("common_baseline")) and bool(shared_components.get("reference_repeat")),
     }
     execution_contract["passed"] = all(execution_contract.values())

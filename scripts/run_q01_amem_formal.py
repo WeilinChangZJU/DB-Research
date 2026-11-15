@@ -129,6 +129,42 @@ def _verify_freeze(
             raise RuntimeError(
                 f"BEMULA_THINKING {actual_thinking!r} differs from frozen thinking mode {expected_thinking!r}"
             )
+    expected_amem_temperature = model_config.get("amem_temperature")
+    if expected_amem_temperature is not None:
+        actual_amem_temperature = float(os.environ.get("BEMULA_AMEM_TEMPERATURE", "0.0"))
+        if actual_amem_temperature != float(expected_amem_temperature):
+            raise RuntimeError(
+                "BEMULA_AMEM_TEMPERATURE "
+                f"{actual_amem_temperature!r} differs from frozen A-MEM temperature "
+                f"{float(expected_amem_temperature)!r}"
+            )
+    expected_replay_policy = model_config.get("provider_replay_policy")
+    if expected_replay_policy is not None:
+        actual_replay_policy = os.environ.get(
+            "BEMULA_PROVIDER_REPLAY_POLICY", "m0_repeat_request_key_cassette"
+        )
+        if actual_replay_policy != expected_replay_policy:
+            raise RuntimeError(
+                f"provider replay policy {actual_replay_policy!r} differs from frozen policy "
+                f"{expected_replay_policy!r}"
+            )
+    # New freeze receipts include ``random_seed`` even when it is explicitly
+    # null.  Enforce that null as well as an integer so an ambient process
+    # seed cannot silently change a supposedly frozen run.  Older receipts
+    # without the key retain their legacy optional behavior.
+    if "random_seed" in model_config:
+        expected_seed = model_config.get("random_seed")
+        raw_seed = os.environ.get("BEMULA_RANDOM_SEED")
+        try:
+            actual_seed = int(raw_seed) if raw_seed not in (None, "") else None
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"BEMULA_RANDOM_SEED {raw_seed!r} is not an integer"
+            ) from exc
+        if actual_seed != expected_seed:
+            raise RuntimeError(
+                f"BEMULA_RANDOM_SEED {raw_seed!r} differs from frozen random seed {expected_seed!r}"
+            )
     expected_base_url = model_config.get("base_url")
     if expected_base_url is not None:
         actual_base_url = os.environ.get("OPENAI_BASE_URL")
@@ -236,6 +272,14 @@ def main() -> int:
     # directory and the child runner could execute a different source tree
     # than the one used for freeze validation.
     child_env["BEMULA_AMEM_PATH"] = str(amem_path)
+    if freeze["model_config"].get("amem_temperature") is not None:
+        child_env["BEMULA_AMEM_TEMPERATURE"] = str(
+            freeze["model_config"]["amem_temperature"]
+        )
+    if freeze["model_config"].get("provider_replay_policy") is not None:
+        child_env["BEMULA_PROVIDER_REPLAY_POLICY"] = str(
+            freeze["model_config"]["provider_replay_policy"]
+        )
     official = freeze["official_amem"]
     child_env["BEMULA_FREEZE_SHA256"] = _sha256(freeze_path)
     child_env["BEMULA_AMEM_COMMIT"] = str(

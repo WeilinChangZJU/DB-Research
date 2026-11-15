@@ -18,6 +18,18 @@ from bemula.research.manifest import sha256_file, sha256_tree
 from scripts.run_q01_amem_formal import PINNED_AMEM_COMMIT
 
 
+# The provider replay policy is part of the correctness oracle.  A repeated
+# M0 build is a fresh runtime/build, but it is backed by the first build's
+# request-key response cassette so provider sampling cannot masquerade as a
+# state-maintenance mismatch.  Keep the value stable across freeze receipts,
+# runner fingerprints, and result summaries.
+M0_REPEAT_PROVIDER_REPLAY_POLICY = "m0_repeat_request_key_cassette"
+# Keep the receipt version stable for existing formal-run consumers; the
+# added model-config fields are optional to readers that already accept
+# unknown keys, while new receipts carry them explicitly.
+FREEZE_SCHEMA_VERSION = 1
+
+
 def _commit(root: Path) -> str:
     try:
         completed = subprocess.run(
@@ -51,7 +63,23 @@ def build_freeze(
     base_url: str | None,
     retrieve_k: int,
     expected_commit: str,
+    amem_temperature: float = 0.0,
+    provider_replay_policy: str = "m0_repeat_request_key_cassette",
+    random_seed: int | None = None,
 ) -> dict[str, Any]:
+    if provider_replay_policy != M0_REPEAT_PROVIDER_REPLAY_POLICY:
+        raise ValueError(
+            "unsupported provider_replay_policy: "
+            f"{provider_replay_policy!r}; expected {M0_REPEAT_PROVIDER_REPLAY_POLICY!r}"
+        )
+    try:
+        amem_temperature = float(amem_temperature)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("amem_temperature must be a finite non-negative number") from exc
+    if not (amem_temperature >= 0.0 and amem_temperature != float("inf")):
+        raise ValueError("amem_temperature must be a finite non-negative number")
+    if random_seed is not None and not isinstance(random_seed, int):
+        raise ValueError("random_seed must be an integer or null")
     amem = amem.resolve()
     if not amem.is_dir():
         raise ValueError(f"A-MEM directory not found: {amem}")
@@ -70,6 +98,9 @@ def build_freeze(
         "thinking": thinking,
         "embedding_backend": embedding_backend,
         "retrieve_k": retrieve_k,
+        "amem_temperature": amem_temperature,
+        "provider_replay_policy": provider_replay_policy,
+        "random_seed": random_seed,
     }
     if base_url:
         model_config["base_url"] = base_url
@@ -78,7 +109,7 @@ def build_freeze(
     else:
         model_config["embedding_model"] = embedding_model
     return {
-        "schema_version": 1,
+        "schema_version": FREEZE_SCHEMA_VERSION,
         "official_amem": {
             "path": str(amem),
             "commit": commit,
@@ -109,6 +140,27 @@ def main() -> int:
     parser.add_argument("--thinking", default=os.environ.get("BEMULA_THINKING", "disabled"))
     parser.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL"))
     parser.add_argument("--retrieve-k", type=int, default=10)
+    parser.add_argument(
+        "--amem-temperature",
+        type=float,
+        default=float(os.environ.get("BEMULA_AMEM_TEMPERATURE", "0.0")),
+        help="Frozen default temperature for official A-MEM metadata/evolution calls.",
+    )
+    parser.add_argument(
+        "--provider-replay-policy",
+        default=os.environ.get(
+            "BEMULA_PROVIDER_REPLAY_POLICY", "m0_repeat_request_key_cassette"
+        ),
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=(
+            int(os.environ["BEMULA_RANDOM_SEED"])
+            if os.environ.get("BEMULA_RANDOM_SEED") not in (None, "")
+            else None
+        ),
+    )
     parser.add_argument("--expected-commit", default=PINNED_AMEM_COMMIT)
     args = parser.parse_args()
     if args.retrieve_k < 1:
@@ -124,6 +176,9 @@ def main() -> int:
         base_url=args.base_url,
         retrieve_k=args.retrieve_k,
         expected_commit=args.expected_commit,
+        amem_temperature=args.amem_temperature,
+        provider_replay_policy=args.provider_replay_policy,
+        random_seed=args.random_seed,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(freeze, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")

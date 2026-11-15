@@ -61,6 +61,51 @@ def test_context_coverage_ratio_is_bounded():
     w=wrapper(('alpha beta',));q=w.query('q')
     assert 0<=q.evidence.details['context_coverage_ratio']<=1, q.evidence.details['context_coverage_ratio']
 
+def test_pinned_amem_structured_context_segments_certify_lineage():
+    w=wrapper(('seed content','first neighbor','second neighbor'),prefix='seg-')
+    system=w._system()
+    system.retriever.only_seed=2
+    system.memories['seg-2'].links=[0,1]
+
+    def official_renderer(query, k=10):
+        notes=list(system.memories.values())
+        parts=[]
+        for i in system.retriever.search(query,k):
+            note=notes[i]
+            parts.append(
+                'talk start time:'+str(note.timestamp)
+                +'memory content: '+str(note.content)
+                +'memory context: '+str(note.context)
+                +'memory keywords: '+str(note.keywords)
+                +'memory tags: '+str(note.tags)+'\n'
+            )
+            for j,neighbor in enumerate(note.links):
+                n=notes[int(neighbor)]
+                parts.append(
+                    'talk start time:'+str(n.timestamp)
+                    +'memory content: '+str(n.content)
+                    +'memory context: '+str(n.context)
+                    +'memory keywords: '+str(n.keywords)
+                    +'memory tags: '+str(n.tags)+'\n'
+                )
+                if j>=k: break
+        return ''.join(parts)
+
+    system.find_related_memories_raw=official_renderer
+    q=w.query('q')
+    assert q.evidence.details['context_segments_complete'] is True
+    assert q.evidence.details['evidence_complete'] is True
+    assert [segment['role'] for segment in q.evidence.details['context_segments']]==['seed','neighbor','neighbor']
+    assert set(q.evidence.source_ids)=={'s0','s1','s2'}
+
+def test_empty_final_context_is_complete_when_raw_renderer_is_observed():
+    w=wrapper(('unused',))
+    w._system().retriever.search=lambda query,k=10: []
+    q=w.query('no-match')
+    assert q.evidence.details['context_segments_complete'] is True
+    assert q.evidence.details['context_mapping_complete'] is True
+    assert q.evidence.details['evidence_complete'] is True
+
 def test_production_fork_keeps_embedder_provider_identity():
     p=production_adapter();cl=p.fork()
     assert cl._system.retriever.model._embedder is cl.embedder, 'retriever uses a deepcopy, adapter counters read the original'
