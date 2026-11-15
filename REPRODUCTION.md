@@ -168,9 +168,14 @@ partial trace as a completed history or as a zero-cost/zero-exposure result.
 
 The command is intentionally serial. Each paired history executes two
 independent M0 rebuilds (the second is a repeatability check) and one common
-baseline build. M1--M3 fork that baseline; they do not re-ingest a retained
-prefix. Checkpoint restore bytes/events, suffix execution, query probes, and
-shared lifecycle components are recorded separately. Resume is safe only when
+baseline build. A single request-keyed counterfactual response cassette is
+shared for correctness across those builds, while provider attempts, method
+memo hits, and oracle cassette hits are counted separately. M1--M3 fork that
+baseline; they do not re-ingest a retained prefix. In `m3_mode=recheck`, the
+restored checkpoint also imports the authorized full old-baseline response
+memo for unchanged suffix requests, while current writes are re-executed.
+Checkpoint restore bytes/events, suffix execution, query probes, and shared
+lifecycle components are recorded separately. Resume is safe only when
 the run fingerprint matches the input, model, retrieval setting and source
 tree.
 

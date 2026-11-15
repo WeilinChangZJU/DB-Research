@@ -14,7 +14,8 @@ full-cost accounting, and interpretation limits.
 
 Current research status: **PROMISING / UNVERIFIED; the platform repair gate
 passes, but the post-repair real-model scientific gate is still open**. The
-current source uses an independent cassette-backed M0 repeat, explicit
+current source uses one common counterfactual response cassette for the paired
+arms plus an independent cassette-backed M0 repeat, explicit
 temperature/replay/seed freeze fields, stable logical origins independent of
 physical UUID ordering, and hash-checked structured final-context lineage.
 M1--M3 share one forkable baseline, M2/M3 use runtime checkpoints instead of
@@ -35,6 +36,9 @@ provider-authentication blocker, and Q01 decision are recorded in
 [docs/Q01_REAL_PILOT_REVIEW_20261115_V2.md](docs/Q01_REAL_PILOT_REVIEW_20261115_V2.md).
 The preceding repair and controlled verification record remains in
 [docs/Q01_REPEAT_LINEAGE_REPAIR_20261115.md](docs/Q01_REPEAT_LINEAGE_REPAIR_20261115.md).
+Fourth-round cache/oracle, identity, fork, renderer, dependency, and controlled
+M0--M3 verification are recorded in
+[docs/Q01_FOURTH_AUDIT_REPAIR_20261115.md](docs/Q01_FOURTH_AUDIT_REPAIR_20261115.md).
 
 ## Setup
 

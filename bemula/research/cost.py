@@ -235,7 +235,10 @@ class CostRecorder:
             "suffix_replayed_events", "checkpoint_restore_events",
             "checkpoint_restore_bytes", "retrieved_candidates",
             "generated_objects", "state_records", "llm_calls", "llm_cache_hits", "input_tokens",
-            "output_tokens", "embedding_calls", "embedding_items",
+            "output_tokens", "provider_attempts", "provider_successes",
+            "method_cache_hits", "oracle_cassette_hits", "provider_input_tokens",
+            "provider_output_tokens", "oracle_input_tokens", "oracle_output_tokens",
+            "embedding_calls", "embedding_items",
             "index_updates", "memory_reads", "bytes_read", "bytes_written",
         )
         counters = {

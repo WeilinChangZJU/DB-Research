@@ -243,7 +243,18 @@ class AmemAdapter(MemoryAdapter):
         source_system = self._system
         target_system = clone._system
         target_system.memories = copy.deepcopy(getattr(source_system, "memories", {}))
-        target_system.retriever = copy.deepcopy(getattr(source_system, "retriever", None))
+        # Preserve non-copyable provider/embedder handles while cloning the
+        # mutable index state.  A retriever may hold the benchmark embedder
+        # directly (or through ``_APIEmbeddingModel``); a plain deepcopy
+        # would duplicate or reject that handle and make a checkpoint fork
+        # unusable.  The memo keeps those service objects shared while all
+        # corpus/embedding/document maps remain independent copies.
+        source_retriever = getattr(source_system, "retriever", None)
+        deepcopy_memo = {
+            id(self.embedder): self.embedder,
+            id(self.llm): self.llm,
+        }
+        target_system.retriever = copy.deepcopy(source_retriever, deepcopy_memo)
         # ``deepcopy(retriever)`` also copies the embedding wrapper and its
         # provider reference.  Rebind the copied wrapper to the fork's
         # provider so actual encode calls and the fork's cost counters observe

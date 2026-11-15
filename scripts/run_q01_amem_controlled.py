@@ -53,9 +53,10 @@ class ScriptedOfficialLLM(BaseLLM):
 
     model = "controlled-scripted-official-v1"
 
-    def __init__(self) -> None:
+    def __init__(self, *, policy: str = "context_sensitive_v1") -> None:
         self.last_usage: dict[str, int] = {}
         self.calls = 0
+        self.policy = policy
 
     def chat(
         self,
@@ -71,8 +72,15 @@ class ScriptedOfficialLLM(BaseLLM):
         output: str
         if task == "amem_answer":
             output = "controlled scripted answer"
-        elif "DECISION:" in upper and "NO_EVOLUTION" in upper:
-            output = "DECISION: NO_EVOLUTION\nREASON: deterministic no-op evolution policy"
+        elif "ANALYZE THE NEW MEMORY NOTE" in upper:
+            if self.policy == "fixed_noop":
+                decision = "NO_EVOLUTION"
+            else:
+                branch = hashlib.sha256(prompt.encode("utf-8")).digest()[0] % 4
+                decision = (
+                    "NO_EVOLUTION", "STRENGTHEN", "UPDATE_NEIGHBOR", "STRENGTHEN_AND_UPDATE"
+                )[branch]
+            output = f"DECISION: {decision}\nREASON: deterministic context-sensitive policy"
         elif "CONNECTIONS:" in upper:
             output = "CONNECTIONS:\nTAGS: controlled, scripted, memory"
         elif "NEIGHBOR 0:" in upper:
@@ -145,6 +153,16 @@ def _load_histories(path: Path) -> list[dict[str, Any]]:
                     content=str(raw["content"]),
                     timestamp=str(raw.get("timestamp", "")),
                     metadata=dict(raw.get("metadata", {})),
+                    speaker=(
+                        str(raw.get("speaker"))
+                        if raw.get("speaker") is not None
+                        else None
+                    ),
+                    session_id=(
+                        str(raw.get("session_id"))
+                        if raw.get("session_id") is not None
+                        else None
+                    ),
                 )
                 for index, raw in enumerate(item.get("events", []))
             ]
@@ -213,6 +231,12 @@ def main() -> int:
         help="M3 dependency policy; recheck enables request-key reuse over a generic re-evaluation.",
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--scripted-policy",
+        choices=("context_sensitive_v1", "fixed_noop"),
+        default="context_sensitive_v1",
+        help="Deterministic controlled LLM policy; context_sensitive_v1 exercises all evolution branches.",
+    )
     args = parser.parse_args()
     if not OFFICIAL_REPO.is_dir():
         raise SystemExit(f"official A-MEM source is missing: {OFFICIAL_REPO}")
@@ -236,6 +260,7 @@ def main() -> int:
         "repository_tree_sha256": sha256_tree(root, exclude=(".venv", ".git", "results")),
         "scripted_model": ScriptedOfficialLLM.model,
         "embedding": {"backend": "hash", "dimension": HashEmbedder.dimension},
+        "scripted_policy": args.scripted_policy,
     }
     store.ensure_fingerprint(fingerprint)
     done = store.completed_ids(validate=True) if args.resume else set()
@@ -252,7 +277,7 @@ def main() -> int:
 
         def factory() -> AmemAdapter:
             return AmemAdapter(
-                ScriptedOfficialLLM(),
+                ScriptedOfficialLLM(policy=args.scripted_policy),
                 repo_path=OFFICIAL_REPO,
                 embedder=embedder,
                 retrieve_k=args.retrieve_k,
@@ -312,6 +337,7 @@ def main() -> int:
             probe = probe_wrapper.query(question)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             after_llm = int(getattr(adapter_llm, "calls", 0) or 0)
+            usage = dict(getattr(adapter_llm, "last_usage", {}) or {})
             after_embed_calls = int(getattr(adapter_embedder, "calls", 0) or 0)
             after_embed_items = int(getattr(adapter_embedder, "items", 0) or 0)
             evidence = probe.evidence
@@ -329,6 +355,9 @@ def main() -> int:
                 "evidence_complete": bool(details.get("evidence_complete", False)),
                 "deleted_source_exposed": deleted_exposed,
                 "query_isolated": query_isolated,
+                "input_tokens": usage.get("prompt_tokens"),
+                "output_tokens": usage.get("completion_tokens"),
+                "query_cost_observed": bool(usage) or max(0, after_llm - before_llm) == 0,
                 "answer_sha256": hashlib.sha256(str(probe.answer).encode("utf-8")).hexdigest(),
             }
             cost.record(
@@ -337,6 +366,10 @@ def main() -> int:
                 duration_ms=elapsed_ms,
                 counters={
                     "llm_calls": max(0, after_llm - before_llm),
+                    "provider_attempts": max(0, after_llm - before_llm),
+                    "provider_successes": max(0, after_llm - before_llm),
+                    "input_tokens": usage.get("prompt_tokens", 0) if usage else 0,
+                    "output_tokens": usage.get("completion_tokens", 0) if usage else 0,
                     "embedding_calls": max(0, after_embed_calls - before_embed_calls),
                     "embedding_items": max(0, after_embed_items - before_embed_items),
                     "retrieved_items": len(details.get("candidate_ids", [])),

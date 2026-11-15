@@ -75,10 +75,22 @@ class BuildCost:
     state_records: int = 0
     llm_calls: int = 0
     llm_cache_hits: int = 0
+    # Logical requests include method-cache and oracle-cassette replays;
+    # provider_attempts are calls that reached the provider boundary. Keeping
+    # both prevents cache hits from being confused with unknown usage.
+    provider_attempts: int = 0
+    provider_successes: int = 0
+    method_cache_hits: int = 0
+    oracle_cassette_hits: int = 0
     # Provider usage is optional.  ``None`` means the boundary did not expose
     # a measurement; it must not be rendered as a measured zero.
     input_tokens: int | None = None
     output_tokens: int | None = None
+    provider_input_tokens: int | None = None
+    provider_output_tokens: int | None = None
+    oracle_input_tokens: int | None = None
+    oracle_output_tokens: int | None = None
+    query_cost_observed: bool | None = None
     embedding_calls: int | None = None
     embedding_items: int | None = None
     index_updates: int = 0

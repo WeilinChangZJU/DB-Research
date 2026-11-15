@@ -333,18 +333,35 @@ def _probe_query(
 
     def optional_total(field: str) -> int | None:
         values = [event.metadata.get(field) for event in llm_events]
-        if not values or any(not isinstance(value, (int, float)) for value in values):
+        if not values:
+            return 0
+        # Cache hits are measured zero provider usage.  If there was a real
+        # provider attempt, every attempt must expose a numeric counter.
+        provider_values = [
+            event.metadata.get(field)
+            for event in llm_events
+            if not bool(event.metadata.get("cache_hit"))
+        ]
+        if not provider_values:
+            return 0
+        if any(not isinstance(value, (int, float)) for value in provider_values):
             return None
-        total = sum(values)
+        total = sum(provider_values)
         return int(total)
 
     input_tokens = optional_total("input_tokens")
     output_tokens = optional_total("output_tokens")
-    usage_observed = bool(llm_events) and all(
-        bool(event.metadata.get("usage_observed"))
-        and isinstance(event.metadata.get("input_tokens"), (int, float))
-        and isinstance(event.metadata.get("output_tokens"), (int, float))
-        for event in llm_events
+    usage_observed = (
+        not llm_events
+        or all(
+            bool(event.metadata.get("cache_hit"))
+            or (
+                bool(event.metadata.get("usage_observed"))
+                and isinstance(event.metadata.get("input_tokens"), (int, float))
+                and isinstance(event.metadata.get("output_tokens"), (int, float))
+            )
+            for event in llm_events
+        )
     )
     evidence = probe.evidence
     details = dict(evidence.details)
@@ -415,10 +432,22 @@ def _probe_query(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "query_cost_observed": usage_observed,
+        "provider_attempts": sum(
+            not bool(event.metadata.get("cache_hit")) for event in llm_events
+        ),
+        "provider_successes": sum(
+            not bool(event.metadata.get("cache_hit")) for event in llm_events
+        ),
         "query_isolated": query_isolated,
     }
     counters: dict[str, int | float] = {
         "llm_calls": len(llm_events),
+        "provider_attempts": sum(
+            not bool(event.metadata.get("cache_hit")) for event in llm_events
+        ),
+        "provider_successes": sum(
+            not bool(event.metadata.get("cache_hit")) for event in llm_events
+        ),
         "retrieved_items": len(details.get("candidate_ids", [])),
         "memory_reads": len(evidence.read_set),
     }

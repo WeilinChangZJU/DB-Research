@@ -188,6 +188,7 @@ class DependencyGraph:
         """Return all downstream identities reachable from deletion roots."""
 
         root_values = [str(root) for root in roots]
+        root_set = set(root_values)
         affected: set[str] = set(root_values)
         queue = deque(root_values)
         while queue:
@@ -198,11 +199,16 @@ class DependencyGraph:
             # graph alias edge.  The latter would make an in-place update
             # appear cyclic to dependency consumers.
             candidate_nodes = {current}
-            candidate_nodes.update(
-                versioned
-                for versioned, logical in self._version_aliases.items()
-                if logical == current
-            )
+            # A logical object supplied as a root is intentionally expanded
+            # to all known versions for backwards compatibility.  A logical
+            # alias reached during propagation is only a reporting identity;
+            # expanding it would re-enter consumers of historical versions.
+            if current in root_set:
+                candidate_nodes.update(
+                    versioned
+                    for versioned, logical in self._version_aliases.items()
+                    if logical == current
+                )
             downstream_ids: set[str] = set()
             for node in candidate_nodes:
                 downstream_ids.update(self._forward.get(node, ()))
@@ -216,7 +222,13 @@ class DependencyGraph:
                     # this keeps existing maintenance code and tests working
                     # while retaining version-level graph nodes.
                     affected.add(logical)
-                    queue.append(logical)
+                    # Expand all physical versions only when the logical
+                    # identity itself is a deletion root.  If a newer
+                    # version is reached through a source/update edge,
+                    # enqueueing the alias would walk back to consumers of
+                    # older versions and over-invalidate the closure.
+                    if logical in root_set:
+                        queue.append(logical)
         return affected
 
     def affected_steps(self, roots: Iterable[str]) -> list[int]:

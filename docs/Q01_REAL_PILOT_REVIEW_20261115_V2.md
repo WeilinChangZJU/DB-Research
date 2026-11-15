@@ -10,7 +10,7 @@ Q01 仍处于 **PROMISING / UNVERIFIED**。本阶段没有证据支持某个维�
 
 1. 冻结的官方 A-MEM commit、DeepSeek 模型配置、本地 embedding、显式删除集合、LoCoMo/LongMemEval-S focused history、串行 M0–M3 runner、隔离 query probe 和全成本 ledger 已经联通到真实 provider 路径。
 2. 上一次有效的 focused real-model pilot（每个 workload 1 个 history、32 个事件、1 个 query）发现：provider request-key cassette 命中完整，但 M0 可见状态仍不稳定；差异来自平台的物理 UUID 到 logical output/source lineage 规范化，而不是 provider response 不一致。
-3. 该 UUID 平局排序和 source `derived_from` 顺序问题已经修复；新增物理 UUID/重复输出回归后，Windows 全套测试为 **135 passed**。
+3. 该 UUID 平局排序和 source `derived_from` 顺序问题已经修复；第四轮又补齐共同 oracle、缓存键、recheck memo、fork、renderer 和版本闭包契约，当前 Windows 全套测试为 **139 passed**。详细记录见 `Q01_FOURTH_AUDIT_REPAIR_20261115.md`。
 4. 修复后的 v2 real-provider 重跑没有形成有效实验结果：DeepSeek 返回 HTTP 401 Authentication Fails，官方 A-MEM 捕获异常并继续写入未演化 note。该 partial run 已停止、排除，不计入任何正确率、成本或 Q01 统计。
 5. wrapper 现在记录 provider error ledger，并在 observe/query 后拒绝上游 fallback；下次认证失败会在首个受影响操作后 fail-fast，而不是继续生成可误读的半成品 trace。
 
@@ -103,7 +103,7 @@ provider 在首个 workload 尚未提交 completed instance 前持续返回 HTTP
 
 ```text
 $env:PYTHONPATH=report/platform python -m pytest -q tests
-135 passed
+139 passed
 ```
 
 新增验收覆盖：

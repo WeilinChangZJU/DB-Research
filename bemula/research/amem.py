@@ -107,14 +107,25 @@ class AmemResearchWrapper(MemoryBackend):
         retrieve_k: int = 10,
         trace: Any | None = None,
         response_cache: dict[str, str] | None = None,
+        cache_mode: str | None = None,
+        response_usage_cache: dict[str, dict[str, Any]] | None = None,
     ):
+        if cache_mode is None:
+            # A direct wrapper must preserve the wrapped builder's behavior.
+            # Memoization is an explicit experiment policy and is enabled by
+            # AmemHistoryBuilder, not silently by instrumentation.
+            cache_mode = "replay" if response_cache is not None else "disabled"
+        if cache_mode not in {"disabled", "method", "record", "replay"}:
+            raise ValueError(f"unknown response cache mode: {cache_mode}")
         self.adapter = adapter
         self.retrieve_k = retrieve_k
         self.trace = trace
+        self.cache_mode = cache_mode
         # A shared request-key cache is used only when a caller explicitly
         # freezes provider responses across independent builds (for example,
         # the M0 repeat oracle). Normal wrappers keep a private cache.
         self._shared_response_cache = response_cache
+        self._shared_response_usage_cache = response_usage_cache
         self.reset()
 
     def reset(self) -> None:
@@ -146,6 +157,14 @@ class AmemResearchWrapper(MemoryBackend):
         self._response_cache: dict[str, str] = (
             self._shared_response_cache
             if self._shared_response_cache is not None
+            else {}
+        )
+        # Usage is kept beside the response cassette.  It is diagnostic
+        # metadata, never part of the request identity and never counted as a
+        # second provider charge on a method-cache hit.
+        self._response_usage_cache: dict[str, dict[str, Any]] = (
+            self._shared_response_usage_cache
+            if self._shared_response_usage_cache is not None
             else {}
         )
         # Physical object IDs can be updated in place by A-MEM.  Keep the
@@ -197,6 +216,9 @@ class AmemResearchWrapper(MemoryBackend):
         clone._logical_ids = copy.deepcopy(self._logical_ids)
         clone._logical_origins = copy.deepcopy(self._logical_origins)
         clone._response_cache = copy.deepcopy(self._response_cache)
+        clone._response_usage_cache = copy.deepcopy(self._response_usage_cache)
+        clone._shared_response_usage_cache = None
+        clone.cache_mode = self.cache_mode
         clone._object_versions = copy.deepcopy(self._object_versions)
         clone._trace_context = copy.deepcopy(self._trace_context)
         clone._checkpoints = {}
@@ -459,6 +481,11 @@ class AmemResearchWrapper(MemoryBackend):
                 "output_tokens": usage_value(usage, "completion_tokens", "output_tokens"),
                 "usage_observed": bool(usage),
                 "cache_hit": cache_hit,
+                "cache_source": (
+                    "method" if cache_hit and self.cache_mode == "method"
+                    else "oracle_cassette" if cache_hit and self.cache_mode == "replay"
+                    else None
+                ),
             }
             if usage:
                 entry["usage"] = dict(usage)
@@ -473,19 +500,71 @@ class AmemResearchWrapper(MemoryBackend):
             )
             return entry
 
-        def wrapped(prompt: str, temperature: float = 0.7, *args: Any, **kwargs: Any) -> str:
+        def request_key(
+            *,
+            surface: str,
+            prompt: Any,
+            args: Sequence[Any],
+            kwargs: Mapping[str, Any],
+            temperature: Any,
+            call_kind: str,
+            owner: Any,
+        ) -> str:
+            """Hash every response-affecting request field.
+
+            The old key only included prompt, temperature and call kind.  It
+            could therefore reuse a completion produced with max_tokens=1 for
+            a max_tokens=9 request.  Keep the key JSON-safe and include the
+            provider identity/configuration when available.
+            """
+            def safe(value: Any) -> Any:
+                if value is None or isinstance(value, (str, int, float, bool)):
+                    return value
+                if isinstance(value, Mapping):
+                    return {str(k): safe(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+                if isinstance(value, (list, tuple)):
+                    return [safe(v) for v in value]
+                return repr(value)
+
+            provider_config = {
+                name: getattr(owner, name, None)
+                for name in ("model", "model_name", "endpoint", "base_url", "seed")
+                if hasattr(owner, name)
+            }
+            payload = {
+                "surface": surface,
+                "prompt": safe(prompt),
+                "args": safe(list(args)),
+                "kwargs": safe(dict(kwargs)),
+                "temperature": safe(temperature),
+                "call_kind": call_kind,
+                "provider": safe(provider_config),
+            }
+            return _hash_text(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=repr))
+
+        def cache_lookup(cache_key: str) -> tuple[bool, str | None, dict[str, Any]]:
+            if self.cache_mode not in {"method", "replay"}:
+                return False, None, {}
+            if cache_key not in self._response_cache:
+                return False, None, {}
+            return True, self._response_cache[cache_key], dict(self._response_usage_cache.get(cache_key, {}))
+
+        def cache_store(cache_key: str, response: str, usage: Mapping[str, Any]) -> None:
+            if self.cache_mode in {"method", "record", "replay"}:
+                self._response_cache[cache_key] = response
+                if usage:
+                    self._response_usage_cache[cache_key] = dict(usage)
+
+        def wrapped(prompt: str, temperature: float = 0.0, *args: Any, **kwargs: Any) -> str:
             prompt_hash = _hash_text(str(prompt))
             call_kind = self._call_kind(str(prompt))
-            cache_key = _hash_text(
-                json.dumps(
-                    {"prompt_hash": prompt_hash, "temperature": temperature, "call_kind": call_kind},
-                    sort_keys=True,
-                )
+            cache_key = request_key(
+                surface="completion", prompt=prompt, args=args, kwargs=kwargs,
+                temperature=temperature, call_kind=call_kind, owner=llm,
             )
-            cache_hit = cache_key in self._response_cache
+            cache_hit, response, cached_usage = cache_lookup(cache_key)
             if cache_hit:
-                response = self._response_cache[cache_key]
-                usage = {}
+                usage = cached_usage
             else:
                 try:
                     response = completion(prompt, *args, temperature=temperature, **kwargs)
@@ -495,8 +574,8 @@ class AmemResearchWrapper(MemoryBackend):
                     )
                     raise
                 response = str(response)
-                self._response_cache[cache_key] = response
                 usage = dict(getattr(llm, "last_usage", {}) or {})
+                cache_store(cache_key, response, usage)
             # This fallback is used only when no provider-level ``chat`` hook
             # exists.  When both surfaces exist, wrapping both would count the
             # same provider request twice because get_completion delegates to
@@ -522,16 +601,13 @@ class AmemResearchWrapper(MemoryBackend):
                 "amem_internal" if task == "amem_internal" else self._call_kind(repr(messages))
             )
             temperature = kwargs.get("temperature")
-            cache_key = _hash_text(
-                json.dumps(
-                    {"prompt_hash": prompt_hash, "temperature": temperature, "call_kind": call_kind},
-                    sort_keys=True,
-                )
+            cache_key = request_key(
+                surface="chat", prompt=messages, args=args, kwargs=kwargs,
+                temperature=temperature, call_kind=call_kind, owner=adapter_llm,
             )
-            cache_hit = cache_key in self._response_cache
+            cache_hit, response, cached_usage = cache_lookup(cache_key)
             if cache_hit:
-                response = self._response_cache[cache_key]
-                usage = {}
+                usage = cached_usage
             else:
                 try:
                     response = adapter_chat(messages, *args, **kwargs)
@@ -541,8 +617,8 @@ class AmemResearchWrapper(MemoryBackend):
                     )
                     raise
                 response = str(response)
-                self._response_cache[cache_key] = response
                 usage = dict(getattr(adapter_llm, "last_usage", {}) or {})
+                cache_store(cache_key, response, usage)
             record_provider_call(
                 response=response,
                 prompt_hash=prompt_hash,
@@ -773,6 +849,16 @@ class AmemResearchWrapper(MemoryBackend):
                     captured["lineage_coverage"] = True
                     captured["lineage_ambiguous"] = False
                     captured["unmapped_context_hash"] = None
+                return
+            # A byte-identical duplicate note can make a renderer appear to
+            # match the reconstructed template while pointing at a different
+            # physical object.  Text reverse-mapping has already marked that
+            # ambiguity; fail closed instead of certifying the wrong source.
+            if captured.get("lineage_ambiguous"):
+                captured["context_segments"] = segments
+                captured["context_segments_complete"] = False
+                captured["context_mapping_complete"] = False
+                captured["lineage_coverage"] = False
                 return
             if _hash_text(expected) != captured.get("raw_context_hash"):
                 return
@@ -1011,7 +1097,10 @@ class AmemResearchWrapper(MemoryBackend):
                 str(record.kind or ""),
                 str(record.version),
                 json.dumps(sorted(record.support_set), ensure_ascii=False),
-                json.dumps(list(record.derived_from), ensure_ascii=False),
+                # Stock A-MEM stores links as physical positions.  A relation
+                # target belongs in the relation export, not in permanent
+                # creation identity; otherwise deleting an unrelated prefix
+                # changes the logical ID of an equivalent object.
                 json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str),
             )
 
@@ -1514,12 +1603,20 @@ class AmemHistoryBuilder:
         trace_context: Mapping[str, Any] | None = None,
         m3_mode: str = "materialized",
         response_cache: dict[str, str] | None = None,
+        cache_mode: str = "method",
+        response_usage_cache: dict[str, dict[str, Any]] | None = None,
     ):
         self.factory = factory
         self.retrieve_k = retrieve_k
         self.trace = trace
         self.trace_context = dict(trace_context or {})
-        self.response_cache = response_cache
+        if cache_mode not in {"disabled", "method", "record", "replay"}:
+            raise ValueError(f"unknown response cache mode: {cache_mode}")
+        self.response_cache = response_cache if response_cache is not None else (
+            {} if cache_mode in {"method", "record", "replay"} else None
+        )
+        self.response_usage_cache = response_usage_cache if response_usage_cache is not None else {}
+        self.cache_mode = cache_mode
         if m3_mode not in {"materialized", "conservative_full", "recheck"}:
             raise ValueError(f"unknown m3_mode: {m3_mode}")
         self.m3_mode = m3_mode
@@ -1530,6 +1627,8 @@ class AmemHistoryBuilder:
             retrieve_k=self.retrieve_k,
             trace=self.trace,
             response_cache=self.response_cache,
+            cache_mode=self.cache_mode,
+            response_usage_cache=self.response_usage_cache,
         )
         wrapper.set_trace_context(**self.trace_context)
         return wrapper
@@ -1560,14 +1659,48 @@ class AmemHistoryBuilder:
         wrapper: AmemResearchWrapper,
         field: str,
         events: Sequence[ProvenanceEvent] | None = None,
+        *,
+        source: str = "logical",
     ) -> int | None:
         observed_events = list(events) if events is not None else wrapper.provenance_events
+        def include(event: ProvenanceEvent) -> bool:
+            if event.event_type is not ProvenanceEventType.LLM_CALL:
+                return False
+            cache_source = event.metadata.get("cache_source")
+            if source == "provider":
+                return cache_source not in {"method", "oracle_cassette"}
+            if source == "oracle":
+                return cache_source == "oracle_cassette"
+            if source == "method":
+                return cache_source == "method"
+            return cache_source != "method"
         values = [
             event.metadata.get(field)
             for event in observed_events
-            if event.event_type is ProvenanceEventType.LLM_CALL
+            if include(event)
         ]
-        if not values or any(value is None for value in values):
+        if not values:
+            # A completed operation containing only cache hits has a measured
+            # provider cost of zero. Unknown usage applies only to an actual
+            # provider call whose boundary did not expose counters.
+            llm_events = [
+                event for event in observed_events
+                if event.event_type is ProvenanceEventType.LLM_CALL
+            ]
+            if not llm_events:
+                return None
+            if source == "provider" and all(
+                event.metadata.get("cache_source") in {"method", "oracle_cassette"}
+                for event in llm_events
+            ):
+                return 0
+            if source in {"logical", "method"} and any(
+                event.metadata.get("cache_source") == "method"
+                for event in llm_events
+            ):
+                return 0
+            return None
+        if any(value is None for value in values):
             return None
         try:
             return sum(int(value) for value in values)
@@ -1687,8 +1820,41 @@ class AmemHistoryBuilder:
                 for event in new_events
                 if event.event_type is ProvenanceEventType.LLM_CALL
             ),
+            provider_attempts=sum(
+                1 for event in new_events
+                if event.event_type is ProvenanceEventType.LLM_CALL
+                and not bool(event.metadata.get("cache_hit"))
+            ),
+            provider_successes=sum(
+                1 for event in new_events
+                if event.event_type is ProvenanceEventType.LLM_CALL
+                and not bool(event.metadata.get("cache_hit"))
+                and not event.metadata.get("provider_error")
+            ),
+            method_cache_hits=sum(
+                bool(event.metadata.get("cache_source") == "method")
+                for event in new_events
+                if event.event_type is ProvenanceEventType.LLM_CALL
+            ),
+            oracle_cassette_hits=sum(
+                bool(event.metadata.get("cache_source") == "oracle_cassette")
+                for event in new_events
+                if event.event_type is ProvenanceEventType.LLM_CALL
+            ),
             input_tokens=self._usage_total(wrapper, "input_tokens", new_events),
             output_tokens=self._usage_total(wrapper, "output_tokens", new_events),
+            provider_input_tokens=self._usage_total(
+                wrapper, "input_tokens", new_events, source="provider"
+            ),
+            provider_output_tokens=self._usage_total(
+                wrapper, "output_tokens", new_events, source="provider"
+            ),
+            oracle_input_tokens=self._usage_total(
+                wrapper, "input_tokens", new_events, source="oracle"
+            ),
+            oracle_output_tokens=self._usage_total(
+                wrapper, "output_tokens", new_events, source="oracle"
+            ),
             memory_reads=sum(
                 1 for event in new_events
                 if event.event_type in {ProvenanceEventType.CANDIDATE, ProvenanceEventType.READ}
@@ -1810,6 +1976,14 @@ class AmemHistoryBuilder:
                 start = materialized_start
                 replay_mode = "read_control_closure"
         wrapper, checkpoint_bytes = baseline.wrapper.fork_checkpoint(start, trace=self.trace)
+        if arm is MaintenanceArm.M3_READ_SET and self.m3_mode == "recheck":
+            # Recheck may reuse exact requests from the complete old baseline,
+            # including an unchanged suffix beyond the restored checkpoint.
+            # Writes still execute against the restored runtime.
+            wrapper._response_cache.update(baseline.wrapper._response_cache)
+            wrapper._response_usage_cache.update(
+                getattr(baseline.wrapper, "_response_usage_cache", {})
+            )
         wrapper.set_trace_context(arm=arm.value, phase="maintenance")
         suffix_result = self.build(
             events,
@@ -2021,12 +2195,22 @@ def run_amem_all_arms(
     m3_mode: str = "materialized",
 ) -> dict[MaintenanceArm, tuple[AmemHistoryResult, StateComparison]]:
     """Run the four fixed arms through a source-aware A-MEM wrapper."""
+    # One frozen response function F is shared by all correctness arms.  The
+    # reference build records provider responses; the repeat and common
+    # baseline replay that oracle while their own method-cache/provider ledgers
+    # remain distinct.  This prevents a D=empty difference from being caused
+    # by a serial provider response rather than maintenance.
+    oracle_cache: dict[str, str] = {}
+    oracle_usage_cache: dict[str, dict[str, Any]] = {}
     builder = AmemHistoryBuilder(
         factory,
         retrieve_k=retrieve_k,
         trace=trace,
         trace_context=trace_context,
         m3_mode=m3_mode,
+        response_cache=oracle_cache,
+        cache_mode="record",
+        response_usage_cache=oracle_usage_cache,
     )
     deleted = tuple(dict.fromkeys(deleted_ids))
     reference_started = time.perf_counter()
@@ -2047,7 +2231,7 @@ def run_amem_all_arms(
     # removing provider stochasticity from the state oracle.  The shared
     # baseline below intentionally uses a separate provider ledger so its
     # lifecycle cost remains observable.
-    repeat_response_cache = dict(reference.wrapper._response_cache)
+    repeat_response_cache = dict(oracle_cache)
     repeat_builder = AmemHistoryBuilder(
         factory,
         retrieve_k=retrieve_k,
@@ -2055,6 +2239,8 @@ def run_amem_all_arms(
         trace_context=trace_context,
         m3_mode=m3_mode,
         response_cache=repeat_response_cache,
+        cache_mode="replay",
+        response_usage_cache=dict(oracle_usage_cache),
     )
     repeat_started = time.perf_counter()
     reference_repeat = repeat_builder.run_arm(
@@ -2072,7 +2258,17 @@ def run_amem_all_arms(
         reference_repeat.wrapper.canonical_snapshot(dataset="amem", instance_id="fixture"),
     )
     common_started = time.perf_counter()
-    common_baseline = builder.build(
+    common_builder = AmemHistoryBuilder(
+        factory,
+        retrieve_k=retrieve_k,
+        trace=trace,
+        trace_context=trace_context,
+        m3_mode=m3_mode,
+        response_cache=dict(oracle_cache),
+        cache_mode="replay",
+        response_usage_cache=dict(oracle_usage_cache),
+    )
+    common_baseline = common_builder.build(
         events,
         arm=MaintenanceArm.M0_FULL_REBUILD,
         trace_phase="common_baseline",
@@ -2124,7 +2320,7 @@ def run_amem_all_arms(
             comparison_reference = reference_repeat
         else:
             maintenance_started = time.perf_counter()
-            result = builder.run_arm(events, deleted, arm, baseline=common_baseline)
+            result = common_builder.run_arm(events, deleted, arm, baseline=common_baseline)
             result.metadata.update(
                 {
                     "shared_baseline": True,
