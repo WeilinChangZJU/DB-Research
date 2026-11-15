@@ -79,6 +79,28 @@ def _write_blocker(
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _load_external_blocker(path: Path) -> dict[str, Any] | None:
+    """Load a prior external-run blocker, if one is present.
+
+    A failed provider call can leave earlier histories committed while the
+    current history is incomplete.  The receipt lets the orchestrator require
+    an explicit checkpoint resume on recovery, so already completed histories
+    are not paid for a second time by accident.  Malformed or unrelated
+    receipts are ignored so a stale local file cannot alter normal execution.
+    """
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    status = payload.get("status")
+    if isinstance(status, str) and status.startswith("blocked_external_"):
+        return payload
+    return None
+
+
 def _resolve_amem_path(freeze_path: Path) -> Path:
     """Resolve the frozen checkout, allowing an explicit env override.
 
@@ -242,7 +264,15 @@ def main() -> int:
     parser.add_argument("--query-limit", type=int, default=1)
     parser.add_argument("--locomo-limit", type=int, default=None)
     parser.add_argument("--longmemeval-limit", type=int, default=None)
-    parser.add_argument("--resume", action="store_true")
+    # An external provider blocker is a durable guard: retrying it must be an
+    # explicit operator decision because the interrupted history may already
+    # have consumed paid requests before its checkpoint was committed.
+    parser.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        help="resume committed histories after an external provider blocker",
+    )
     parser.add_argument("--evidence-level", default="real_model_formal")
     args = parser.parse_args()
     if args.query_limit < 1:
@@ -266,9 +296,34 @@ def main() -> int:
         print(blocker_path)
         return 2
     if not os.environ.get("OPENAI_API_KEY"):
-        _write_blocker(blocker_path, message="OPENAI_API_KEY is not configured; no real-model call was started", freeze=freeze_path)
+        # Preserve a prior external-provider receipt.  Overwriting a 402
+        # blocker with a missing-key blocker would remove the explicit resume
+        # guard and allow a later invocation to replay a paid partial history.
+        if _load_external_blocker(blocker_path) is None:
+            _write_blocker(
+                blocker_path,
+                message="OPENAI_API_KEY is not configured; no real-model call was started",
+                freeze=freeze_path,
+            )
         print(blocker_path)
         return 2
+
+    prior_blocker = _load_external_blocker(blocker_path)
+    if prior_blocker is not None and not args.resume:
+        prior_status = prior_blocker.get("status", "blocked_external_model_run")
+        _write_blocker(
+            blocker_path,
+            message=(
+                f"prior external-run blocker {prior_status!r} is still present; "
+                "pass --resume after fixing the provider condition to retry"
+            ),
+            freeze=freeze_path,
+            status=str(prior_status),
+        )
+        print(blocker_path)
+        return 3
+
+    resume = bool(args.resume)
 
     args.out_root.mkdir(parents=True, exist_ok=True)
     child_env = dict(os.environ)
@@ -321,7 +376,7 @@ def main() -> int:
         ]
         if limit is not None:
             command.extend(["--limit", str(limit)])
-        if args.resume:
+        if resume:
             command.append("--resume")
         stderr_path = out / "runner.stderr.log"
         out.mkdir(parents=True, exist_ok=True)
@@ -354,6 +409,13 @@ def main() -> int:
         ],
         check=True,
     )
+    # A successful end-to-end run supersedes any earlier external blocker.
+    # Leaving the receipt behind would make a later invocation look blocked
+    # even though all workloads and the review completed successfully.
+    try:
+        blocker_path.unlink()
+    except FileNotFoundError:
+        pass
     return 0
 
 

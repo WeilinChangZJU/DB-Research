@@ -154,6 +154,12 @@ PYTHONPATH=. uv run python scripts/run_q01_amem_formal.py \
   --resume
 ```
 
+Before retrying a run that stopped with `formal_run_blocker.json` status
+`blocked_external_model_run`, repair the provider condition and pass `--resume`
+explicitly. The interrupted history may have paid requests without a committed
+instance checkpoint, so the runner refuses an implicit replay; a successful
+end-to-end review removes the active blocker receipt.
+
 The command is intentionally serial. Each paired history executes two
 independent M0 rebuilds (the second is a repeatability check) and one common
 baseline build. M1--M3 fork that baseline; they do not re-ingest a retained

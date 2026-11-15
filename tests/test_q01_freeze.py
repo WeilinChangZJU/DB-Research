@@ -1,8 +1,10 @@
 from pathlib import Path
 import json
+import sys
 
 from bemula.research.manifest import sha256_tree
 from scripts.build_q01_amem_freeze import build_freeze
+import scripts.run_q01_amem_formal as formal_runner
 from scripts.run_q01_amem_paired import (
     _frozen_runtime_config,
     _load_histories,
@@ -176,4 +178,47 @@ def test_formal_freeze_verifies_optional_runtime_model_settings(tmp_path: Path, 
         longmemeval=longmem,
         amem_path=amem,
     )["model_config"]["thinking"] == "disabled"
+
+
+def test_formal_runner_missing_key_writes_zero_cost_blocker(tmp_path: Path, monkeypatch):
+    """A missing credential must stop before either workload child is started."""
+
+    freeze = tmp_path / "freeze.json"
+    freeze.write_text("{}", encoding="utf-8")
+    locomo = tmp_path / "locomo.jsonl"
+    longmemeval = tmp_path / "longmemeval.jsonl"
+    locomo.write_text("{}\n", encoding="utf-8")
+    longmemeval.write_text("{}\n", encoding="utf-8")
+    amem = tmp_path / "A-mem"
+    amem.mkdir()
+    out_root = tmp_path / "run"
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("BEMULA_AMEM_PATH", str(amem))
+    monkeypatch.setattr(
+        formal_runner,
+        "_verify_freeze",
+        lambda *args, **kwargs: {"model_config": {}},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_q01_amem_formal.py",
+            "--freeze",
+            str(freeze),
+            "--locomo",
+            str(locomo),
+            "--longmemeval",
+            str(longmemeval),
+            "--out-root",
+            str(out_root),
+        ],
+    )
+
+    assert formal_runner.main() == 2
+    blocker = json.loads((out_root / "formal_run_blocker.json").read_text(encoding="utf-8"))
+    assert blocker["status"] == "blocked_missing_external_model_state"
+    assert blocker["api_key_configured"] is False
+    assert "no real-model call was started" in blocker["message"]
 
