@@ -23,6 +23,17 @@ ARMS = (
     "M2_replay_repair_all",
     "M3_exact_read_set",
 )
+OPTIONAL_ARMS = ("M_DAG_materialized_dependency_repair_all",)
+
+
+def _arms_for_rows(rows: list[dict[str, Any]]) -> tuple[str, ...]:
+    """Return core arms plus any explicitly requested optional baselines."""
+
+    names = list(ARMS)
+    for arm in OPTIONAL_ARMS:
+        if any(arm in row.get("arms", {}) for row in rows):
+            names.append(arm)
+    return tuple(names)
 
 # BuildCost fields that can be added across the maintenance execution and the
 # paired baseline setup. Current runs record one shared baseline component;
@@ -143,8 +154,9 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                 line = next((item for item in handle if item.strip()), "")
             if line:
                 rows.append(json.loads(line))
+    run_arms = _arms_for_rows(rows)
     arm_summary: dict[str, Any] = {}
-    for arm in ARMS:
+    for arm in run_arms:
         arm_row_pairs = [
             (row.get("instance_id"), row["arms"][arm])
             for row in rows
@@ -212,7 +224,7 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
 
     probes = []
     for row in rows:
-        for arm in ARMS:
+        for arm in run_arms:
             probe = row.get("arms", {}).get(arm, {}).get("query_probe")
             if probe is None:
                 continue
@@ -289,14 +301,17 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                 shared_components[scope_name] = bucket
     row_contracts = []
     for row in rows:
-        arms = row.get("arms", {})
-        m0_metadata = arms.get("M0_full_rebuild", {}).get("metadata", {})
-        m1_metadata = arms.get("M1_tombstone_filter", {}).get("metadata", {})
-        m2_metadata = arms.get("M2_replay_repair_all", {}).get("metadata", {})
-        m3_metadata = arms.get("M3_exact_read_set", {}).get("metadata", {})
+        row_arms = row.get("arms", {})
+        row_arm_map = row.get("arms", {})
+        m0_metadata = row_arm_map.get("M0_full_rebuild", {}).get("metadata", {})
+        m1_metadata = row_arm_map.get("M1_tombstone_filter", {}).get("metadata", {})
+        m2_metadata = row_arm_map.get("M2_replay_repair_all", {}).get("metadata", {})
+        m3_metadata = row_arm_map.get("M3_exact_read_set", {}).get("metadata", {})
+        mdag_metadata = row_arm_map.get(OPTIONAL_ARMS[0], {}).get("metadata", {})
+        mdag_present = OPTIONAL_ARMS[0] in row_arm_map
         query_present = all(
-            isinstance(arms.get(arm, {}).get("query_probe"), dict)
-            for arm in ARMS
+            isinstance(row_arm_map.get(arm, {}).get("query_probe"), dict)
+            for arm in run_arms
         )
         row_contracts.append(
             {
@@ -318,6 +333,16 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                 "shared_baseline": all(
                     metadata.get("shared_baseline") is True
                     for metadata in (m1_metadata, m2_metadata, m3_metadata)
+                ),
+                "m_dag": (
+                    not mdag_present
+                    or (
+                        mdag_metadata.get("dependency_baseline")
+                        == "materialized_dependency_dag"
+                        and mdag_metadata.get("dag_complete") is True
+                        and mdag_metadata.get("repair_policy")
+                        == "repair_all_downstream_events"
+                    )
                 ),
                 "checkpoint_replay": (
                     m2_metadata.get("checkpoint_restored") is True
@@ -342,10 +367,10 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                 "query_probe_present": query_present,
                 "context_lineage_complete": all(
                     bool(record.get("context_segments_complete", False))
-                    for arm_name in ARMS
+                    for arm_name in run_arms
                     for record in (
-                        arms.get(arm_name, {}).get("query_probe", {}).get("records", [])
-                        if isinstance(arms.get(arm_name, {}).get("query_probe"), dict)
+                        row_arm_map.get(arm_name, {}).get("query_probe", {}).get("records", [])
+                        if isinstance(row_arm_map.get(arm_name, {}).get("query_probe"), dict)
                         else []
                     )
                 ),
@@ -359,6 +384,9 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
         "all_shared_baselines_verified": bool(row_contracts) and all(item["shared_baseline"] for item in row_contracts),
         "all_checkpoint_replays_verified": bool(row_contracts) and all(item["checkpoint_replay"] for item in row_contracts),
         "all_m3_strong_policies_verified": bool(row_contracts) and all(item["m3_strong_policy"] for item in row_contracts),
+        "all_optional_m_dag_contracts_verified": bool(row_contracts) and all(
+            item["m_dag"] for item in row_contracts
+        ),
         "all_query_probes_present": bool(row_contracts) and all(item["query_probe_present"] for item in row_contracts),
         "all_context_lineage_verified": bool(row_contracts) and all(
             item["context_lineage_complete"] for item in row_contracts
@@ -381,7 +409,7 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                     and isinstance(row["arms"].get(arm), dict)
                     and row["arms"][arm].get("state_hash")
                     and isinstance(row["arms"][arm].get("cost"), dict)
-                    for arm in ARMS
+                    for arm in run_arms
                 )
                 for row in rows
             )
@@ -426,7 +454,7 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
         "query_gate": {
             "all_arms_have_probe": bool(rows) and all(
                 isinstance(row.get("arms", {}).get(arm, {}).get("query_probe"), dict)
-                for row in rows for arm in ARMS
+                for row in rows for arm in run_arms
             ),
             "all_probes_isolated": bool(probes) and all(item["query_isolated"] for item in probes),
             "all_probes_evidence_complete": bool(probes) and all(item["evidence_complete"] for item in probes),
@@ -466,7 +494,7 @@ def _markdown(report: dict[str, Any]) -> str:
                 "|---|---:|---:|---:|---:|---:|",
             ]
         )
-        for arm in ARMS:
+        for arm in workload.get("arm_summary", {}):
             value = workload["arm_summary"][arm]
             lines.append(
                 f"| {arm} | {value['exact_count']}/{value['instances']} | {display(value['replayed_events'])} | {display(value['llm_calls'])} | {display(value['embedding_calls'])} | {display(value['wall_time_ms'])} |"
@@ -519,3 +547,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

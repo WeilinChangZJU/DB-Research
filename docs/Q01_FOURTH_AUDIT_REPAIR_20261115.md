@@ -13,6 +13,11 @@
 - completion fallback 的默认 temperature 固定为 0.0；controlled loader 保留顶层 speaker/session 字段。
 - 结构化 renderer 在重复内容导致来源歧义时 fail-closed；不能仅凭相同渲染字节认证错误来源。
 - 版本化依赖闭包不再把旧版本消费者错误回溯为当前删除的 downstream；显式 logical root 仍保持兼容展开。
+- 串行 paired runner 的每个 history 现在另建 query-scoped request-key
+  cassette。第一个隔离 probe 为新请求键记录 provider 响应，后续 arm 仅复用
+  相同完整请求键；共享的只有不可变响应映射，adapter/retriever/provenance
+  状态仍然 fork-local。query cassette 命中标记为 `oracle_cassette`，其 provider
+  tokens 为已知零，并与 method-cache 命中分开进入 query cost ledger。
 
 ## 本地验收
 
@@ -20,10 +25,10 @@
 
 ```text
 PYTHONPATH=report/platform python -m pytest -q -p no:cacheprovider report/platform/tests
-139 passed
+146 passed
 ```
 
-新增 tests/test_q01_round4_repairs.py 4 项均通过。第四轮独立契约测试中，14 项契约有 12 项通过；余下 2 项是旧的诊断断言，分别要求 M2/M3 继续保持相同工作、以及要求空删除产生 provider-world 差异，二者正是本轮修复目标，修复后的正确断言已经加入 source tests。
+新增 round-four/M-DAG tests 均通过。第四轮独立契约测试中，14 项契约有 12 项通过；余下 2 项是旧的诊断断言，分别要求 M2/M3 继续保持相同工作、以及要求空删除产生 provider-world 差异，二者正是本轮修复目标，修复后的正确断言已经加入 source tests。M-DAG 作为显式可选第五臂实现：它从完整 wrapper-visible materialized dependency graph 计算对象级闭包，repair-all 重放下游事件，并通过 `--include-m-dag` 启用；默认 M0--M3 receipt schema 不变。
 
 ## 官方 A-MEM 受控串行闭环
 

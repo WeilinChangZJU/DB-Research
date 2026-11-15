@@ -8,6 +8,7 @@ an actual memory builder is instrumented:
 * M1: tombstone/filter of materialized state;
 * M2: suffix replay from the earliest deleted source;
 * M3: replay from the earliest step invalidated by a recorded read/control set.
+* M-DAG (opt-in): repair-all from a transitive materialized dependency closure.
 
 This is a reference harness.  It is not an efficacy baseline for Bemula or a
 claim that an arbitrary memory system supports exact incremental deletion.
@@ -30,6 +31,11 @@ class MaintenanceArm(str, Enum):
     M1_TOMBSTONE = "M1_tombstone_filter"
     M2_REPLAY = "M2_replay_repair_all"
     M3_READ_SET = "M3_exact_read_set"
+    # Optional audit baseline.  It is deliberately not part of the default
+    # M0--M3 matrix: callers must opt in so historical reports retain the
+    # four-arm schema while the required materialized-DAG comparison remains
+    # available as a separately identified policy.
+    M_DAG_REPAIR_ALL = "M_DAG_materialized_dependency_repair_all"
 
 
 @dataclass(frozen=True)
@@ -301,6 +307,37 @@ class DeterministicMemoryBuilder:
             return self._replay_from_start(
                 events, deleted, arm, start=start, mode="conservative_suffix"
             )
+        if arm is MaintenanceArm.M_DAG_REPAIR_ALL:
+            # The DAG baseline uses every *materialized* read, candidate,
+            # support and control edge recorded by the deterministic trace.
+            # It repairs all events from the earliest affected boundary,
+            # allowing normal retrieval/write logic to run again.  This is a
+            # distinct baseline from M2's source-position suffix policy and
+            # from M3's generic recheck policy; hidden/unmaterialized
+            # dependencies remain outside this arm's declared scope.
+            affected, closure = self._materialized_dag_closure(baseline, deleted)
+            fallback = self._earliest_deleted_index(events, deleted)
+            start = min(affected) if affected else fallback
+            result = self._replay_from_start(
+                events,
+                deleted,
+                arm,
+                start=start,
+                mode="materialized_dependency_repair_all",
+            )
+            result.metadata.update(
+                {
+                    "affected_steps": affected,
+                    "dag_roots": sorted(deleted),
+                    "dag_closure": sorted(closure),
+                    "replay_start": start,
+                    "dependency_baseline": "materialized_dependency_dag",
+                    "dag_complete": True,
+                    "dag_scope": "materialized_read_candidate_support_control_edges",
+                    "repair_policy": "repair_all_downstream_events",
+                }
+            )
+            return result
         if arm is MaintenanceArm.M3_READ_SET:
             # M3 uses the recorded read/candidate/control closure to choose a
             # safe invalidation point.  It is intentionally a separate method
@@ -383,6 +420,34 @@ class DeterministicMemoryBuilder:
         return result
 
     @staticmethod
+    def _materialized_dag_closure(
+        baseline: BuildResult, deleted: set[str]
+    ) -> tuple[list[int], set[str]]:
+        """Compute a transitive source/object closure from the materialized trace.
+
+        Each build step contributes source/object nodes and output objects. A
+        step is affected when it consumes a node already in the closure; its
+        outputs then become roots for later consumers. This is intentionally
+        an object-level repair-all baseline, whereas M3's predicate only
+        chooses a read/control invalidation boundary.
+        """
+
+        closure = set(str(value) for value in deleted)
+        affected: list[int] = []
+        for step in sorted(baseline.trace, key=lambda item: item.index):
+            consumed = {
+                str(step.source_id),
+                *(str(value) for value in step.read_set),
+                *(str(value) for value in step.candidate_ids),
+                *(str(value) for value in step.support_set),
+                *(str(value) for value in getattr(step, "control_set", ())),
+            }
+            if closure.intersection(consumed):
+                affected.append(step.index)
+                closure.update(str(value) for value in step.output_ids)
+        return affected, closure
+
+    @staticmethod
     def _earliest_deleted_index(events: Sequence[SourceEvent], deleted: set[str]) -> int:
         for index, event in enumerate(events):
             if event.source_id in deleted:
@@ -423,6 +488,7 @@ def run_all_arms(
     deleted_ids: Iterable[str],
     *,
     builder: DeterministicMemoryBuilder | None = None,
+    include_m_dag: bool = False,
 ) -> dict[MaintenanceArm, tuple[BuildResult, StateComparison]]:
     """Run M0-M3 and compare each result with the M0 reference.
 
@@ -437,7 +503,15 @@ def run_all_arms(
     reference_repeat = builder.run_arm(events, deleted, MaintenanceArm.M0_FULL_REBUILD)
     common_baseline = builder.build(events)
     output: dict[MaintenanceArm, tuple[BuildResult, StateComparison]] = {}
-    for arm in MaintenanceArm:
+    arms = [
+        MaintenanceArm.M0_FULL_REBUILD,
+        MaintenanceArm.M1_TOMBSTONE,
+        MaintenanceArm.M2_REPLAY,
+        MaintenanceArm.M3_READ_SET,
+    ]
+    if include_m_dag:
+        arms.append(MaintenanceArm.M_DAG_REPAIR_ALL)
+    for arm in arms:
         result = reference if arm is MaintenanceArm.M0_FULL_REBUILD else builder.run_arm(
             events, deleted, arm, baseline=common_baseline
         )

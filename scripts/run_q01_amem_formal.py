@@ -261,6 +261,11 @@ def main() -> int:
         default="conservative_full",
         help="M3 dependency policy; conservative_full is the correctness baseline.",
     )
+    parser.add_argument(
+        "--include-m-dag",
+        action="store_true",
+        help="also run and review the explicit materialized dependency-DAG repair-all arm",
+    )
     parser.add_argument("--query-limit", type=int, default=1)
     parser.add_argument("--locomo-limit", type=int, default=None)
     parser.add_argument("--longmemeval-limit", type=int, default=None)
@@ -382,6 +387,7 @@ def main() -> int:
             "--out", str(out),
             "--retrieve-k", str(args.retrieve_k),
             "--m3-mode", args.m3_mode,
+            *( ["--include-m-dag"] if args.include_m_dag else [] ),
             "--query-limit", str(args.query_limit),
             "--agent-model", args.agent_model,
         ]

@@ -1958,6 +1958,16 @@ class AmemHistoryBuilder:
         if arm is MaintenanceArm.M2_REPLAY:
             start = self._earliest_deleted_source_index(events, deleted)
             replay_mode = "conservative_suffix"
+        elif arm is MaintenanceArm.M_DAG_REPAIR_ALL:
+            # Explicit materialized dependency-DAG baseline.  The graph is
+            # reconstructed from the completed baseline trace and includes
+            # every observed source/object read, candidate, support and
+            # control edge.  Repair-all re-executes every event from the
+            # earliest affected step, so ordinary retrieval and write logic
+            # can regenerate downstream objects and dependencies.
+            dag_info = self._materialized_dag_boundary(events, deleted, baseline)
+            start = dag_info["start"]
+            replay_mode = "materialized_dependency_repair_all"
         else:
             if self.m3_mode == "conservative_full":
                 # A complete generic dependency baseline must remain correct
@@ -1976,10 +1986,15 @@ class AmemHistoryBuilder:
                 start = materialized_start
                 replay_mode = "read_control_closure"
         wrapper, checkpoint_bytes = baseline.wrapper.fork_checkpoint(start, trace=self.trace)
-        if arm is MaintenanceArm.M3_READ_SET and self.m3_mode == "recheck":
+        if (
+            arm is MaintenanceArm.M3_READ_SET
+            and self.m3_mode == "recheck"
+        ) or arm is MaintenanceArm.M_DAG_REPAIR_ALL:
             # Recheck may reuse exact requests from the complete old baseline,
             # including an unchanged suffix beyond the restored checkpoint.
-            # Writes still execute against the restored runtime.
+            # The materialized DAG baseline uses the same frozen request
+            # function F so its comparison cannot be polluted by provider
+            # sampling; writes still execute against the restored runtime.
             wrapper._response_cache.update(baseline.wrapper._response_cache)
             wrapper._response_usage_cache.update(
                 getattr(baseline.wrapper, "_response_usage_cache", {})
@@ -2008,6 +2023,13 @@ class AmemHistoryBuilder:
                     )
                     if arm is MaintenanceArm.M3_READ_SET
                     else "conservative_suffix_checkpoint_replay"
+                    if arm is MaintenanceArm.M2_REPLAY
+                    else "materialized_dependency_repair_all_checkpoint_replay"
+                ),
+                "dag_status": (
+                    "materialized_dependency_repair_all"
+                    if arm is MaintenanceArm.M_DAG_REPAIR_ALL
+                    else None
                 ),
                 "m3_mode": self.m3_mode if arm is MaintenanceArm.M3_READ_SET else None,
                 "materialized_candidate_start": materialized_start if arm is MaintenanceArm.M3_READ_SET else None,
@@ -2018,6 +2040,8 @@ class AmemHistoryBuilder:
                     if arm is MaintenanceArm.M3_READ_SET and self.m3_mode == "recheck"
                     else "materialized_read_control_set"
                     if arm is MaintenanceArm.M3_READ_SET
+                    else "materialized_dependency_dag"
+                    if arm is MaintenanceArm.M_DAG_REPAIR_ALL
                     else None
                 ),
                 "checkpoint_restored": True,
@@ -2025,8 +2049,27 @@ class AmemHistoryBuilder:
                 "checkpoint_event": start,
                 "checkpoint_restore_size_kind": "semantic_snapshot_utf8_bytes",
                 "checkpoint_restore_scope": "canonical_state_estimate",
+                "response_reuse_policy": (
+                    "common_baseline_request_key_cassette"
+                    if arm is MaintenanceArm.M_DAG_REPAIR_ALL
+                    else "common_baseline_request_key_cassette"
+                    if arm is MaintenanceArm.M3_READ_SET and self.m3_mode == "recheck"
+                    else None
+                ),
             }
         )
+        if arm is MaintenanceArm.M_DAG_REPAIR_ALL:
+            suffix_result.metadata.update(
+                {
+                    "dag_complete": True,
+                    "dag_scope": "materialized_read_candidate_support_control_edges",
+                    "repair_policy": "repair_all_downstream_events",
+                    "dag_roots": list(dag_info["roots"]),
+                    "dag_closure": list(dag_info["closure"]),
+                    "dag_affected_steps": list(dag_info["affected_steps"]),
+                    "dag_boundary_fallback": bool(dag_info["fallback"]),
+                }
+            )
         suffix_replayed = suffix_result.cost.replayed_events
         suffix_result.cost = replace(
             suffix_result.cost,
@@ -2170,6 +2213,65 @@ class AmemHistoryBuilder:
         return len(events)
 
     @staticmethod
+    def _materialized_dag_boundary(
+        events: Sequence[SourceEvent],
+        deleted: set[str],
+        baseline: AmemHistoryResult,
+    ) -> dict[str, Any]:
+        """Return an auditable repair-all boundary from the materialized DAG.
+
+        This intentionally uses only edges observed in the completed baseline
+        trace.  The resulting policy is a fair materialized-dependency
+        baseline, not a claim that hidden NOOP/query predicates are known.
+        ``complete=True`` records that the graph includes all wrapper-visible
+        edge kinds, while ``dag_scope`` in the result states its semantic
+        boundary explicitly.
+        """
+
+        object_roots = {
+            object_id
+            for source_id in deleted
+            for object_id in baseline.wrapper._source_to_objects.get(source_id, set())
+        }
+        roots = set(str(value) for value in deleted) | set(str(value) for value in object_roots)
+        graph = baseline.wrapper.dependency_graph(complete=True)
+        closure = graph.affected_closure(sorted(roots)) if roots else set()
+        graph_steps = graph.affected_steps(sorted(roots)) if roots else []
+        # Dependency-event steps and source-event indices are intentionally
+        # different clocks (an observe call emits ingest/LLM/write events).
+        # Never use a raw graph step as a checkpoint index.  Map affected
+        # source IDs to the corresponding external event index and retain the
+        # deleted source's own position as a mandatory lower bound.
+        affected_sources: set[str] = set()
+        for event in baseline.wrapper.provenance_events:
+            if event.step not in set(graph_steps):
+                continue
+            affected_sources.update(str(value) for value in event.source_ids)
+            current = event.metadata.get("current_source_id")
+            if current:
+                affected_sources.add(str(current))
+        source_steps = [
+            step.index
+            for step in baseline.trace
+            if str(step.source_id) in affected_sources
+        ]
+        deleted_start = AmemHistoryBuilder._earliest_deleted_source_index(events, deleted)
+        affected_steps = sorted(set(source_steps) | ({deleted_start} if deleted_start < len(events) else set()))
+        if affected_steps:
+            start = min(affected_steps)
+            fallback = not bool(source_steps)
+        else:
+            start = deleted_start
+            fallback = True
+        return {
+            "start": start,
+            "roots": sorted(roots),
+            "closure": sorted(closure),
+            "affected_steps": affected_steps,
+            "fallback": fallback,
+        }
+
+    @staticmethod
     def _earliest_deleted_source_index(events: Sequence[SourceEvent], deleted: set[str]) -> int:
         """Return the first position whose own source is deleted.
 
@@ -2193,8 +2295,14 @@ def run_amem_all_arms(
     trace: Any | None = None,
     trace_context: Mapping[str, Any] | None = None,
     m3_mode: str = "materialized",
+    include_m_dag: bool = False,
 ) -> dict[MaintenanceArm, tuple[AmemHistoryResult, StateComparison]]:
-    """Run the four fixed arms through a source-aware A-MEM wrapper."""
+    """Run fixed M0--M3 arms, optionally adding the explicit M-DAG baseline.
+
+    The extra arm is opt-in to preserve the historical four-arm receipt
+    schema.  When enabled, it is reported separately from both M2 suffix
+    replay and M3 read/control recheck.
+    """
     # One frozen response function F is shared by all correctness arms.  The
     # reference build records provider responses; the repeat and common
     # baseline replay that oracle while their own method-cache/provider ledgers
@@ -2279,7 +2387,15 @@ def run_amem_all_arms(
     )
     output: dict[MaintenanceArm, tuple[AmemHistoryResult, StateComparison]] = {}
 
-    for arm in MaintenanceArm:
+    arms = [
+        MaintenanceArm.M0_FULL_REBUILD,
+        MaintenanceArm.M1_TOMBSTONE,
+        MaintenanceArm.M2_REPLAY,
+        MaintenanceArm.M3_READ_SET,
+    ]
+    if include_m_dag:
+        arms.append(MaintenanceArm.M_DAG_REPAIR_ALL)
+    for arm in arms:
         if arm is MaintenanceArm.M0_FULL_REBUILD:
             result = reference
             result.metadata.update(

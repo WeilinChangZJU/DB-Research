@@ -308,8 +308,20 @@ def _probe_query(
     question_id: str,
     deleted: set[str],
     trace: TraceRecorder,
+    response_cache: dict[str, str] | None = None,
+    response_usage_cache: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, int | float], float]:
-    """Run one post-maintenance query on an isolated runtime fork."""
+    """Run one post-maintenance query on an isolated runtime fork.
+
+    ``response_cache`` is an optional run-level request-key cassette.  When
+    supplied, every isolated query fork shares that cassette in ``replay``
+    mode: the first request for a new key reaches the provider and records its
+    response, while subsequent arms reuse the exact response.  This keeps
+    behavior/evidence comparisons on one frozen response function without
+    sharing mutable memory state.  The cache is intentionally separate from
+    the builder's method memo and is therefore reported as an oracle-cassette
+    hit rather than a method-cache hit.
+    """
 
     probe_wrapper = result.wrapper
     query_isolated = False
@@ -320,6 +332,18 @@ def _probe_query(
         # Preserve the probe as a diagnostic, but make the missing isolation
         # explicit in the receipt and never use it as a continuation oracle.
         probe_wrapper = result.wrapper
+    if query_isolated and response_cache is not None:
+        # ``fork`` deep-copies the builder cache to keep each runtime
+        # independent.  Query behavior needs the opposite only for the
+        # immutable request-key response mapping, so replace that copy with a
+        # shared cassette while retaining the forked adapter/retriever state.
+        probe_wrapper._response_cache = response_cache
+        probe_wrapper._shared_response_cache = response_cache
+        if response_usage_cache is None:
+            response_usage_cache = {}
+        probe_wrapper._response_usage_cache = response_usage_cache
+        probe_wrapper._shared_response_usage_cache = response_usage_cache
+        probe_wrapper.cache_mode = "replay"
     probe_wrapper.set_trace_context(phase="query_probe", query_id=question_id)
     before_events = len(probe_wrapper.provenance_events)
     started = time.perf_counter()
@@ -351,6 +375,15 @@ def _probe_query(
 
     input_tokens = optional_total("input_tokens")
     output_tokens = optional_total("output_tokens")
+    oracle_cassette_hits = sum(
+        event.metadata.get("cache_source") == "oracle_cassette"
+        for event in llm_events
+    )
+    method_cache_hits = sum(
+        event.metadata.get("cache_source") == "method"
+        for event in llm_events
+    )
+    cache_hits = oracle_cassette_hits + method_cache_hits
     usage_observed = (
         not llm_events
         or all(
@@ -429,6 +462,9 @@ def _probe_query(
         "evidence_complete": bool(details.get("evidence_complete", False)),
         "deleted_source_exposed": deleted_exposed,
         "llm_calls": len(llm_events),
+        "cache_hits": cache_hits,
+        "oracle_cassette_hits": oracle_cassette_hits,
+        "method_cache_hits": method_cache_hits,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "query_cost_observed": usage_observed,
@@ -442,6 +478,9 @@ def _probe_query(
     }
     counters: dict[str, int | float] = {
         "llm_calls": len(llm_events),
+        "cache_hits": cache_hits,
+        "oracle_cassette_hits": oracle_cassette_hits,
+        "method_cache_hits": method_cache_hits,
         "provider_attempts": sum(
             not bool(event.metadata.get("cache_hit")) for event in llm_events
         ),
@@ -482,6 +521,14 @@ def main() -> int:
         help="M3 dependency policy; conservative_full is the correctness baseline.",
     )
     parser.add_argument(
+        "--include-m-dag",
+        action="store_true",
+        help=(
+            "Also run the explicit materialized dependency-DAG repair-all baseline "
+            "as a fifth opt-in arm."
+        ),
+    )
+    parser.add_argument(
         "--query-limit",
         type=int,
         default=1,
@@ -519,6 +566,7 @@ def main() -> int:
         "effective_serve_k": args.retrieve_k,
         "query_limit": args.query_limit,
         "m3_mode": args.m3_mode,
+        "include_m_dag": bool(args.include_m_dag),
         "repository_tree_sha256": tree_digest,
         "agent_model": args.agent_model,
         "embed_backend": os.environ.get("BEMULA_EMBED_BACKEND", "api"),
@@ -560,6 +608,7 @@ def main() -> int:
             factory,
             retrieve_k=args.retrieve_k,
             m3_mode=args.m3_mode,
+            include_m_dag=args.include_m_dag,
             trace=trace,
             trace_context={
                 "instance_id": instance_id,
@@ -602,8 +651,22 @@ def main() -> int:
             for arm, (result, _comparison) in outputs.items()
         }
         query_probes: dict[str, dict[str, Any]] = {}
+        # Build a single request-key query cassette for this history.  The
+        # first isolated query fork seeds it with the builder's already-known
+        # responses; new query keys are recorded at the provider boundary and
+        # reused by later arms.  This shares only immutable response data, not
+        # adapter/runtime state, so ``query_isolated`` remains meaningful.
+        query_response_cache: dict[str, str] | None = None
+        query_response_usage_cache: dict[str, dict[str, Any]] | None = None
         for arm, (result, _comparison) in outputs.items():
             records: list[dict[str, Any]] = []
+            if query_response_cache is None:
+                query_response_cache = dict(
+                    getattr(result.wrapper, "_response_cache", {})
+                )
+                query_response_usage_cache = dict(
+                    getattr(result.wrapper, "_response_usage_cache", {})
+                )
             for item in query_items:
                 record, counters, elapsed_ms = _probe_query(
                     result,
@@ -612,6 +675,8 @@ def main() -> int:
                     question_id=item["question_id"],
                     deleted=deleted,
                     trace=trace,
+                    response_cache=query_response_cache,
+                    response_usage_cache=query_response_usage_cache,
                 )
                 records.append(record)
                 cost.record(
@@ -654,6 +719,8 @@ def main() -> int:
                     question_id=item["question_id"],
                     deleted=deleted,
                     trace=trace,
+                    response_cache=query_response_cache,
+                    response_usage_cache=query_response_usage_cache,
                 )
                 record["reference_repeat"] = True
                 repeat_records.append(record)

@@ -44,6 +44,20 @@ def test_m3_records_affected_steps_and_state_hash_is_stable():
     assert result.snapshot.state_hash == reference.snapshot.state_hash
 
 
+def test_optional_mdag_is_distinct_materialized_dependency_repair_all():
+    runs = run_all_arms(_events(), {"src-a"}, include_m_dag=True)
+    result, comparison = runs[MaintenanceArm.M_DAG_REPAIR_ALL]
+    assert comparison.equal
+    assert result.metadata["dependency_baseline"] == "materialized_dependency_dag"
+    assert result.metadata["repair_policy"] == "repair_all_downstream_events"
+    assert result.metadata["dag_complete"] is True
+    assert "src-a" in result.metadata["dag_closure"]
+    assert any(str(node).startswith("fact:") for node in result.metadata["dag_closure"])
+    assert result.metadata["replay_mode"] == "materialized_dependency_repair_all"
+    # The default matrix remains exactly four arms unless explicitly enabled.
+    assert MaintenanceArm.M_DAG_REPAIR_ALL not in run_all_arms(_events(), {"src-a"})
+
+
 def test_replay_does_not_skip_events_after_nonzero_earliest_delete():
     events = [
         SourceEvent("e0", "src-0", "alpha note"),

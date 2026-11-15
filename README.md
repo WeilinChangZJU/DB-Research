@@ -2,7 +2,8 @@
 
 This repository is the latest source-only snapshot for the Q01 validation
 platform. It contains the benchmark adapters, source-aware A-MEM wrapper,
-serial M0–M3 maintenance runner, provenance/state/cost instrumentation, tests,
+serial M0–M3 maintenance runner, an opt-in materialized dependency-DAG
+repair-all baseline, provenance/state/cost instrumentation, tests,
 and reproduction documentation. It intentionally excludes datasets, generated
 histories, API keys, raw traces, experiment results, and external repository
 clones.
@@ -22,12 +23,18 @@ M1--M3 share one forkable baseline, M2/M3 use runtime checkpoints instead of
 hidden prefix re-ingestion, and visible/runtime comparison layers are reported
 separately. Canonical identity preserves source/time/origin distinctions and
 ordered retrieval links; physical UUIDs are excluded from query evidence
-signatures. The formal runner defaults to
+signatures. Post-maintenance query probes use a separate history-scoped
+request-key oracle cassette across isolated arm forks; query cassette hits are
+reported separately from method-cache hits and provider attempts. The formal runner defaults to
 `m3_mode=conservative_full`, which replays the complete retained history as a
 conservative correctness baseline. `m3_mode=materialized` is a limited
 diagnostic policy, while `m3_mode=recheck` is a generic re-evaluation policy
 with exact request-key response reuse. Neither mode is presented as a proven
-optimal dependency algorithm. The latest bounded real-model pilot review is in
+optimal dependency algorithm. The optional `--include-m-dag` flag adds a
+separately reported `M_DAG_materialized_dependency_repair_all` arm; it uses
+the complete wrapper-visible materialized dependency closure and repairs all
+downstream events, while remaining explicit that hidden dependencies are out
+of scope. The latest bounded real-model pilot review is in
 [docs/Q01_PILOT_REVIEW_20261115.md](docs/Q01_PILOT_REVIEW_20261115.md), and
 third-audit repairs are recorded in
 [docs/Q01_THIRD_AUDIT_REPAIR_20261115.md](docs/Q01_THIRD_AUDIT_REPAIR_20261115.md).
@@ -39,6 +46,9 @@ The preceding repair and controlled verification record remains in
 Fourth-round cache/oracle, identity, fork, renderer, dependency, and controlled
 M0--M3 verification are recorded in
 [docs/Q01_FOURTH_AUDIT_REPAIR_20261115.md](docs/Q01_FOURTH_AUDIT_REPAIR_20261115.md).
+The v6 controlled lineage/DAG review, full controlled cost ledger, and current
+real-provider blocker are recorded in
+[docs/Q01_FIFTH_STAGE_CONTROLLED_V6_20261115.md](docs/Q01_FIFTH_STAGE_CONTROLLED_V6_20261115.md).
 
 ## Setup
 
@@ -238,3 +248,6 @@ For a formal run, first create the local freeze receipt with
 `scripts/build_q01_amem_freeze.py`. It verifies the external A-MEM checkout is
 at the pinned commit and records input/source/model hashes without copying
 datasets, credentials, or results into this repository.
+
+
+

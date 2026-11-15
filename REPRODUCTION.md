@@ -6,6 +6,11 @@ This repository contains the latest source code for the Q01 validation platform.
 - **M1**: live source tombstone/filter with retriever rebuild and no repair.
 - **M2**: conservative suffix replay from a runtime checkpoint immediately
   before the earliest deleted source.
+- **M-DAG** (optional): materialized dependency-DAG repair-all. It computes a
+  transitive closure over all observed source/object, candidate, support and
+  control edges, then re-executes every downstream event from the earliest
+  affected checkpoint. This is a separate audit baseline; it does not claim
+  to know hidden or unmaterialized NOOP/query predicates.
 - **M3**: explicit dependency-baseline policy. The formal runner defaults to
   `m3_mode=conservative_full`, which restores the empty checkpoint and replays
   the complete retained history as a conservative correctness baseline. The
@@ -150,6 +155,7 @@ PYTHONPATH=. uv run python scripts/run_q01_amem_formal.py \
   --agent-model deepseek-flash \
   --retrieve-k 5 \
   --query-limit 1 \
+  --include-m-dag \
   --evidence-level real_model_focused_window \
   --resume
 ```
@@ -179,6 +185,38 @@ lifecycle components are recorded separately. Resume is safe only when
 the run fingerprint matches the input, model, retrieval setting and source
 tree.
 
+To add the explicit materialized-DAG repair-all arm to a cost-bounded run,
+pass `--include-m-dag` to the paired runner (or to the formal orchestrator,
+which forwards the flag to both workloads):
+
+```bash
+PYTHONPATH=. uv run python scripts/run_q01_amem_paired.py \
+  --histories ../q01_inputs/focused_window_pilot/locomo_explicit_histories_focused_pilot.jsonl \
+  --out ../q01_runs/formal_real_focused_window/locomo_mdag \
+  --include-m-dag --m3-mode conservative_full --query-limit 1 \
+  --agent-model deepseek-flash
+```
+
+The extra arm is absent by default so existing four-arm M0--M3 receipts keep
+their schema. When enabled, review rows carry the arm name
+`M_DAG_materialized_dependency_repair_all`, `dependency_baseline` equal to
+`materialized_dependency_dag`, a `dag_closure`, and the explicit
+`repair_policy=repair_all_downstream_events`. Its response cassette is copied
+from the common baseline for a fixed counterfactual response function; cache
+hits and provider attempts remain separate in the full cost ledger.
+
+For each history, post-maintenance query probes use a second, history-scoped
+request-key cassette. The first isolated probe fork records a response for a
+new query request key; later arm forks reuse that exact response when the
+request key is identical. Only the response mapping is shared: every adapter,
+retriever, and provenance trace remains fork-local, and `query_isolated` must
+still be true. Query cassette hits are labelled `oracle_cassette`, have known
+zero provider tokens, and are kept separate from builder method-cache hits.
+Different contexts can legitimately produce different request keys and then
+incur a provider attempt; this is recorded rather than silently treated as a
+cache hit. The query probe therefore is a frozen request-function comparison,
+not an independent stochastic provider trial.
+
 ## 5. Review outputs
 
 Each workload directory should contain:
@@ -207,16 +245,26 @@ The reviewer emits JSON and Markdown. Check all of the following before interpre
 3. `visible_state_hash`/canonical state mismatches are inspected by object and relationship, not reduced to an answer score.
 4. Query probes are evidence-complete and their read/context source sets do not contain the deleted source. A missing evidence mapping is an unknown, not proof of zero exposure.
 5. Query answer-model tokens are present in the query cost scope. Older runs made before the query-chat hook was added have unknown query cost and must not report it as zero.
-6. Continuation answer/evidence hashes are compared against the isolated M0
+6. Query `oracle_cassette` hits and provider attempts are separated in the
+   query cost ledger; a shared response mapping must never be counted as a
+   method-cache saving.
+7. Continuation answer/evidence hashes are compared against the isolated M0
    probe. A failed isolation or incomplete context mapping is an execution
    limitation, not evidence that the deletion method is wrong or successful.
-7. M2/M3 replay mode, checkpoint restoration, and status are read from
+8. M2/M3 replay mode, checkpoint restoration, and status are read from
 per-arm metadata. Formal review requires the conservative M3 status
 `strong_conservative_full_history_checkpoint_replay` and the
 `complete_conservative_barrier` dependency-baseline marker. A label alone is
 not evidence that a new algorithm is superior; the materialized policy remains
 diagnostic and is labelled
 `limited_materialized_read_control_checkpoint_replay`.
+
+9. When `--include-m-dag` is used, the optional
+   `M_DAG_materialized_dependency_repair_all` row must report
+   `dependency_baseline=materialized_dependency_dag`, `dag_complete=true`,
+   `repair_policy=repair_all_downstream_events`, and explicit
+   `dag_roots`/`dag_closure`. Its cost is compared separately from M2 suffix
+   replay and M3 generic recheck/full replay.
 
 For a focused pilot, the correct scientific interpretation is execution evidence only. It does not estimate natural occurrence rates, establish generality, prove novelty, or justify a superiority claim. Calibrate repeated M0 variability before attributing real-model mismatches to maintenance.
 
@@ -244,3 +292,4 @@ These verify platform contracts only. They are not evidence that a memory builde
 - Do not compare runs made with different prompts, temperature, provider endpoints, retrieval implementations, or deletion masks.
 - Report provider token usage and measured wall time separately; do not infer provider money cost without a dated pricing record.
 - Preserve failed or blocked runs as small sanitized receipts when they explain a gate decision, but remove raw logs and temporary extraction trees before publishing the source repository.
+

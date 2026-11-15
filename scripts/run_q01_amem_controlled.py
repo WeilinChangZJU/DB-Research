@@ -230,6 +230,14 @@ def main() -> int:
         default="materialized",
         help="M3 dependency policy; recheck enables request-key reuse over a generic re-evaluation.",
     )
+    parser.add_argument(
+        "--include-m-dag",
+        action="store_true",
+        help=(
+            "Also run the explicit materialized dependency-DAG repair-all "
+            "baseline as a fifth opt-in arm."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--scripted-policy",
@@ -257,6 +265,7 @@ def main() -> int:
         "histories_sha256": sha256_file(args.histories),
         "retrieve_k": args.retrieve_k,
         "m3_mode": args.m3_mode,
+        "include_m_dag": bool(args.include_m_dag),
         "repository_tree_sha256": sha256_tree(root, exclude=(".venv", ".git", "results")),
         "scripted_model": ScriptedOfficialLLM.model,
         "embedding": {"backend": "hash", "dimension": HashEmbedder.dimension},
@@ -297,6 +306,7 @@ def main() -> int:
                 "selection": instance.get("selection", {}),
             },
             m3_mode=args.m3_mode,
+            include_m_dag=args.include_m_dag,
         )
         # Probe the actual serving path after maintenance.  The question is a
         # hash-stable snippet of the deleted event, so the probe can detect
@@ -352,6 +362,12 @@ def main() -> int:
                 "selected_ids": list(details.get("selected_ids", [])),
                 "context_object_ids": list(details.get("read_object_ids", [])),
                 "context_source_ids": list(details.get("context_source_ids", [])),
+                "context_segments": list(details.get("context_segments", [])),
+                "context_segments_complete": bool(details.get("context_segments_complete", False)),
+                "context_mapping_complete": bool(details.get("context_mapping_complete", False)),
+                "lineage_coverage": bool(details.get("lineage_coverage", False)),
+                "context_coverage": bool(details.get("context_coverage", False)),
+                "raw_context_hash": details.get("raw_context_hash"),
                 "evidence_complete": bool(details.get("evidence_complete", False)),
                 "deleted_source_exposed": deleted_exposed,
                 "query_isolated": query_isolated,
@@ -447,6 +463,7 @@ def main() -> int:
                 "resume": args.resume,
                 "retrieve_k": args.retrieve_k,
                 "m3_mode": args.m3_mode,
+                "include_m_dag": bool(args.include_m_dag),
             },
             extra={"run_fingerprint_sha256": store.load_fingerprint()["sha256"]},
         ),
