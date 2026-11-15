@@ -108,17 +108,38 @@ class DependencyGraph:
             self.add(DependencyEdge(decision_id, normalized_object, "decision_object", event.step, event.query_id))
             if versioned_object != normalized_object:
                 self.add(DependencyEdge(decision_id, versioned_object, "decision_object_version", event.step, event.query_id))
+        event_kind = event.event_type.value
+        output_ids = {self._normalize_object_id(value) for value in event.object_ids}
         for candidate_id in event.candidate_ids:
+            normalized_candidate = self._normalize_object_id(candidate_id)
+            has_version = bool(
+                candidate_versions.get(str(candidate_id))
+                or candidate_versions.get(normalized_candidate)
+            )
+            # Legacy write/update traces sometimes repeat the output ID in
+            # candidate_ids without recording the prior object version.  An
+            # unversioned input edge would create a false decision/object
+            # cycle, so preserve the edge only when a prior version is
+            # available (new traces) or when the candidate is distinct from
+            # the materialized output.
+            if event_kind in {"write", "update"} and normalized_candidate in output_ids and not has_version:
+                continue
             self.add(DependencyEdge(candidate_node(candidate_id), decision_id, "candidate_decision", event.step, event.query_id))
         # ``selected_ids`` are inputs for read/select/query events, but the
         # wrapper also uses the field as a compatibility output list on write
         # and update events.  Treating those outputs as inputs creates an
         # unversioned decision <-> object cycle and is not an execution DAG.
-        event_kind = event.event_type.value
         if event_kind not in {"write", "update"}:
             for selected_id in event.selected_ids:
                 self.add(DependencyEdge(candidate_node(selected_id), decision_id, "selected_decision", event.step, event.query_id))
         for control_id in event.control_dependencies:
+            normalized_control = self._normalize_object_id(control_id)
+            has_version = bool(
+                candidate_versions.get(str(control_id))
+                or candidate_versions.get(normalized_control)
+            )
+            if event_kind in {"write", "update"} and normalized_control in output_ids and not has_version:
+                continue
             self.add(DependencyEdge(candidate_node(control_id), decision_id, "control_dependency", event.step, event.query_id))
 
     @staticmethod

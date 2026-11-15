@@ -3,6 +3,7 @@ import json
 
 from bemula.research.manifest import sha256_tree
 from scripts.build_q01_amem_freeze import build_freeze
+from scripts.run_q01_amem_paired import _load_histories
 from scripts.run_q01_amem_formal import _resolve_amem_path, _source_tree_files_only, _verify_freeze
 
 
@@ -28,6 +29,34 @@ def test_formal_uses_freeze_checkout_path_unless_overridden(tmp_path: Path, monk
     override = tmp_path / "override"
     monkeypatch.setenv("BEMULA_AMEM_PATH", str(override))
     assert _resolve_amem_path(freeze) == override.resolve()
+
+
+def test_serial_history_loader_rejects_empty_and_duplicate_event_streams(tmp_path: Path):
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text(json.dumps({"instance_id": "h0", "events": []}) + "\n", encoding="utf-8")
+    try:
+        _load_histories(empty)
+    except ValueError as exc:
+        assert "events list" in str(exc)
+    else:
+        raise AssertionError("empty history should be rejected")
+
+    duplicate = tmp_path / "duplicate.jsonl"
+    row = {
+        "instance_id": "h1",
+        "events": [
+            {"event_id": "e0", "source_id": "s0", "content": "a"},
+            {"event_id": "e0", "source_id": "s1", "content": "b"},
+        ],
+        "deleted_source_ids": [],
+    }
+    duplicate.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    try:
+        _load_histories(duplicate)
+    except ValueError as exc:
+        assert "duplicate event IDs" in str(exc)
+    else:
+        raise AssertionError("duplicate event IDs should be rejected")
 
 
 def test_freeze_builder_records_commit_and_input_hashes(tmp_path: Path, monkeypatch):

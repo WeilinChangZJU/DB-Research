@@ -61,3 +61,19 @@ def test_versioned_output_keeps_logical_id_in_affected_closure():
     closure = graph.affected_closure(["src-a"])
     assert "note-a@v1" in closure
     assert "note-a" in closure
+
+
+def test_legacy_in_place_update_does_not_create_object_decision_cycle():
+    event = ProvenanceEvent(
+        event_id="e1",
+        event_type=ProvenanceEventType.UPDATE,
+        step=1,
+        source_ids=["src-a"],
+        candidate_ids=["note-a"],
+        object_ids=["note-a"],
+    )
+    graph = DependencyGraph.from_events([event])
+    assert not any(
+        edge["upstream"] == "note-a" and edge["downstream"] == "decision:1:update"
+        for edge in graph.to_dict()["edges"]
+    )

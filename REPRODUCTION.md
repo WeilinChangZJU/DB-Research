@@ -130,8 +130,9 @@ PYTHONPATH=. uv run python scripts/build_q01_amem_freeze.py \
 
 The helper refuses a non-git A-MEM directory or a checkout other than the
 pinned commit.  The receipt records the endpoint URL and thinking mode when
-provided; it never records an API key.  A freeze receipt is local run state
-and must remain outside Git.
+provided, and the formal orchestrator checks those values together with the
+embedding backend/model and retrieval `k`; it never records an API key.  A
+freeze receipt is local run state and must remain outside Git.
 
 Run LoCoMo first and LongMemEval-S second. `--limit 1` means one history, not one event; use the focused-window inputs above to keep a real pilot affordable:
 
