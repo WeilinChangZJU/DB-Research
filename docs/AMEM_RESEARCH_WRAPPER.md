@@ -61,14 +61,25 @@ the official A-MEM repository nor a model client. The expected contract is:
 | M3 | replay from the observed dependency boundary | exact to M0 |
 
 M2 restores the checkpoint immediately before the earliest deleted source and
-replays the retained suffix. M3 restores the checkpoint before the earliest
-materialized read/control-affected step and replays from that boundary. Their
-costs are scoped as `maintenance_checkpoint_replay`; retained-prefix execution
-is zero and restore cost is reported separately. M3 is still a limited
-materialized read/control baseline, not a complete exact read-set/control
-dependency engine: query invalidation, NOOP predicate scope, output-stability
-propagation and full input memoization remain explicit follow-up work. Results
-are labelled `m3_status=limited_materialized_read_control_checkpoint_replay`.
+replays the retained suffix. The runner exposes two explicit M3 policies. The
+default formal policy, `m3_mode=conservative_full`, restores the empty
+checkpoint and replays the complete retained history; this is a conservative
+correctness baseline with a separate `maintenance_checkpoint_replay` cost and
+is labelled `m3_status=strong_conservative_full_history_checkpoint_replay`.
+The `m3_mode=materialized` policy restores the checkpoint before the earliest
+materialized read/control-affected step and replays from that boundary. It is
+kept for diagnostic efficiency comparisons only and is labelled
+`m3_status=limited_materialized_read_control_checkpoint_replay`; it does not
+claim complete query invalidation, NOOP predicate scope, output-stability
+propagation, or full input memoization.
+
+All checkpoint arms report restore, prefix, suffix, retrieval, generation,
+embedding, index, validation, and instrumentation costs in the same lifecycle
+ledger. The in-memory checkpoint is an executable fork for one paired run; the
+exported JSON is an audit snapshot and is not presented as a durable runtime
+restore artifact. Provider fork metadata records whether replay used
+request-key determinism or a shared unreplayed provider, so unstable real-model
+replay cannot be silently treated as an exact equality result.
 
 `run_amem_all_arms` also runs two independent M0 rebuilds. The second is a
 repeatability check, while one additional full build is shared as the baseline

@@ -39,6 +39,11 @@ class DependencyGraph:
         self.edges: list[DependencyEdge] = []
         self._forward: dict[str, set[str]] = defaultdict(set)
         self._reverse: dict[str, set[str]] = defaultdict(set)
+        # Versioned object nodes retain their logical object identity for
+        # deletion roots and legacy callers.  This is an alias index rather
+        # than an extra graph edge, so it cannot introduce a decision/object
+        # self-cycle in the execution graph.
+        self._version_aliases: dict[str, str] = {}
 
     def add(self, edge: DependencyEdge) -> None:
         key = (edge.upstream, edge.downstream, edge.kind, edge.step, edge.query_id)
@@ -60,6 +65,28 @@ class DependencyGraph:
             or f"decision:{event.step}:{event.event_type.value}"
         )
         operation_node = f"operation:{operation_id}"
+        object_versions = {
+            str(key): str(value)
+            for key, value in (event.metadata.get("object_versions", {}) or {}).items()
+        }
+        candidate_versions = {
+            str(key): str(value)
+            for key, value in (event.metadata.get("candidate_versions", {}) or {}).items()
+        }
+
+        def versioned(value: str, versions: Mapping[str, str]) -> str:
+            normalized = self._normalize_object_id(value)
+            version = versions.get(str(value)) or versions.get(normalized)
+            if not version:
+                return normalized
+            versioned_id = f"{normalized}@{version}"
+            self._version_aliases[versioned_id] = normalized
+            return versioned_id
+
+        def candidate_node(value: str) -> str:
+            """Resolve a candidate to the namespaced version node."""
+            return versioned(value, candidate_versions)
+
         if operation_node != decision_id:
             self.add(DependencyEdge(operation_node, decision_id, "operation_decision", event.step, event.query_id))
         current_source_id = str(event.metadata.get("current_source_id", ""))
@@ -76,9 +103,13 @@ class DependencyGraph:
                 edge_kind = "source_operation"
             self.add(DependencyEdge(source_text, operation_node, edge_kind, event.step, event.query_id))
         for object_id in event.object_ids:
-            self.add(DependencyEdge(decision_id, self._normalize_object_id(object_id), "decision_object", event.step, event.query_id))
+            normalized_object = self._normalize_object_id(object_id)
+            versioned_object = versioned(object_id, object_versions)
+            self.add(DependencyEdge(decision_id, normalized_object, "decision_object", event.step, event.query_id))
+            if versioned_object != normalized_object:
+                self.add(DependencyEdge(decision_id, versioned_object, "decision_object_version", event.step, event.query_id))
         for candidate_id in event.candidate_ids:
-            self.add(DependencyEdge(self._normalize_object_id(candidate_id), decision_id, "candidate_decision", event.step, event.query_id))
+            self.add(DependencyEdge(candidate_node(candidate_id), decision_id, "candidate_decision", event.step, event.query_id))
         # ``selected_ids`` are inputs for read/select/query events, but the
         # wrapper also uses the field as a compatibility output list on write
         # and update events.  Treating those outputs as inputs creates an
@@ -86,9 +117,9 @@ class DependencyGraph:
         event_kind = event.event_type.value
         if event_kind not in {"write", "update"}:
             for selected_id in event.selected_ids:
-                self.add(DependencyEdge(self._normalize_object_id(selected_id), decision_id, "selected_decision", event.step, event.query_id))
+                self.add(DependencyEdge(candidate_node(selected_id), decision_id, "selected_decision", event.step, event.query_id))
         for control_id in event.control_dependencies:
-            self.add(DependencyEdge(self._normalize_object_id(control_id), decision_id, "control_dependency", event.step, event.query_id))
+            self.add(DependencyEdge(candidate_node(control_id), decision_id, "control_dependency", event.step, event.query_id))
 
     @staticmethod
     def _normalize_object_id(value: str) -> str:
@@ -121,14 +152,36 @@ class DependencyGraph:
     def affected_closure(self, roots: Iterable[str]) -> set[str]:
         """Return all downstream identities reachable from deletion roots."""
 
-        affected: set[str] = set(roots)
-        queue = deque(roots)
+        root_values = [str(root) for root in roots]
+        affected: set[str] = set(root_values)
+        queue = deque(root_values)
         while queue:
             current = queue.popleft()
-            for downstream in sorted(self._forward.get(current, ())):
+            # A caller may still provide a logical object ID (for example
+            # ``n1``) while new traces use ``n1@<version>`` nodes.  Expand
+            # all known versions of that logical ID without materialising a
+            # graph alias edge.  The latter would make an in-place update
+            # appear cyclic to dependency consumers.
+            candidate_nodes = {current}
+            candidate_nodes.update(
+                versioned
+                for versioned, logical in self._version_aliases.items()
+                if logical == current
+            )
+            downstream_ids: set[str] = set()
+            for node in candidate_nodes:
+                downstream_ids.update(self._forward.get(node, ()))
+            for downstream in sorted(downstream_ids):
                 if downstream not in affected:
                     affected.add(downstream)
                     queue.append(downstream)
+                logical = self._version_aliases.get(downstream)
+                if logical and logical not in affected:
+                    # Preserve the legacy logical identity in the closure;
+                    # this keeps existing maintenance code and tests working
+                    # while retaining version-level graph nodes.
+                    affected.add(logical)
+                    queue.append(logical)
         return affected
 
     def affected_steps(self, roots: Iterable[str]) -> list[int]:

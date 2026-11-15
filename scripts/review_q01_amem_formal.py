@@ -49,6 +49,12 @@ _COST_FIELDS = (
     "bytes_written",
 )
 
+_INSTRUMENTATION_FIELDS = (
+    "score_encode_calls",
+    "score_matrix_rows",
+    "score_matrix_values",
+)
+
 
 def _hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -79,6 +85,14 @@ def _optional_int(value: Any) -> int | None:
     return int(value)
 
 
+def _sum_optional(values: list[int | None]) -> int | None:
+    """Sum observed counters while keeping any missing value unknown."""
+
+    if not values or any(value is None for value in values):
+        return None
+    return sum(value for value in values if value is not None)
+
+
 def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
     instance_dir = run / "checkpoints" / "instances"
     rows: list[dict[str, Any]] = []
@@ -90,7 +104,12 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                 rows.append(json.loads(line))
     arm_summary: dict[str, Any] = {}
     for arm in ARMS:
-        arm_rows = [row["arms"][arm] for row in rows if arm in row.get("arms", {})]
+        arm_row_pairs = [
+            (row.get("instance_id"), row["arms"][arm])
+            for row in rows
+            if arm in row.get("arms", {})
+        ]
+        arm_rows = [pair[1] for pair in arm_row_pairs]
         # ``cost`` is the arm-local execution.  Shared baseline and reference
         # repeat builds are recorded once in the lifecycle cost ledger rather
         # than duplicated into every M1-M3 row.
@@ -122,8 +141,8 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
             "instances": len(arm_rows),
             "exact_count": sum(bool(row.get("exact_to_m0")) for row in arm_rows),
             "mismatched_instances": [
-                rows[index].get("instance_id")
-                for index, row in enumerate([row["arms"][arm] for row in rows if arm in row.get("arms", {})])
+                instance_id
+                for instance_id, row in arm_row_pairs
                 if not row.get("exact_to_m0")
             ],
             # Top-level fields report arm-local execution.  Shared lifecycle
@@ -154,12 +173,16 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                             "deleted_source_exposed": bool(record.get("deleted_source_exposed", False)),
                             "read_count": len(record.get("read_set", [])),
                             "candidate_count": len(record.get("candidate_ids", [])),
-                            "llm_calls": _optional_int(record.get("llm_calls")) or 0,
+                            # A missing query trace is unknown, not zero.  The
+                            # runner normally records this as an observable
+                            # event count; legacy rows may omit it.
+                            "llm_calls": _optional_int(record.get("llm_calls")),
                             "input_tokens": _optional_int(record.get("input_tokens")),
                             "output_tokens": _optional_int(record.get("output_tokens")),
                             "query_cost_observed": bool(record.get("query_cost_observed", False)),
                             "query_isolated": bool(record.get("query_isolated", False)),
                             "continuation_checks_passed": bool(record.get("continuation_check_passed", False)),
+                            "instrumentation_cost": dict(record.get("instrumentation_cost", {}) or {}),
                         }
                     )
                 continue
@@ -168,7 +191,7 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                 output_total = _optional_int(probe.get("output_tokens"))
                 read_count = len(probe.get("read_set", []))
                 candidate_count = len(probe.get("candidate_ids", []))
-                llm_calls = _optional_int(probe.get("llm_calls")) or 0
+                llm_calls = _optional_int(probe.get("llm_calls"))
                 evidence_complete = bool(probe.get("evidence_complete", False))
                 deleted_exposed = bool(probe.get("deleted_source_exposed", False))
                 cost_observed = bool(probe.get("query_cost_observed", False))
@@ -189,6 +212,7 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                     "continuation_checks_passed": bool(
                         probe.get("continuation_checks_passed", False)
                     ),
+                    "instrumentation_cost": dict(probe.get("instrumentation_cost", {}) or {}),
                 }
             )
     cost_summary_path = run / "cost_summary.json"
@@ -202,6 +226,47 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
             bucket = scopes.get(scope_name)
             if isinstance(bucket, dict):
                 shared_components[scope_name] = bucket
+    row_contracts = []
+    for row in rows:
+        arms = row.get("arms", {})
+        m0_metadata = arms.get("M0_full_rebuild", {}).get("metadata", {})
+        m1_metadata = arms.get("M1_tombstone_filter", {}).get("metadata", {})
+        m2_metadata = arms.get("M2_replay_repair_all", {}).get("metadata", {})
+        m3_metadata = arms.get("M3_exact_read_set", {}).get("metadata", {})
+        query_present = all(
+            isinstance(arms.get(arm, {}).get("query_probe"), dict)
+            for arm in ARMS
+        )
+        row_contracts.append(
+            {
+                "m0_repeat": m0_metadata.get("reference_repeat_equal") is True,
+                "shared_baseline": all(
+                    metadata.get("shared_baseline") is True
+                    for metadata in (m1_metadata, m2_metadata, m3_metadata)
+                ),
+                "checkpoint_replay": (
+                    m2_metadata.get("checkpoint_restored") is True
+                    and m3_metadata.get("checkpoint_restored") is True
+                ),
+                "m3_strong_policy": (
+                    m3_metadata.get("m3_mode") == "conservative_full"
+                    and m3_metadata.get("m3_status")
+                    == "strong_conservative_full_history_checkpoint_replay"
+                    and m3_metadata.get("dependency_baseline")
+                    == "complete_conservative_barrier"
+                ),
+                "query_probe_present": query_present,
+            }
+        )
+    execution_contract = {
+        "all_m0_repeats_verified": bool(row_contracts) and all(item["m0_repeat"] for item in row_contracts),
+        "all_shared_baselines_verified": bool(row_contracts) and all(item["shared_baseline"] for item in row_contracts),
+        "all_checkpoint_replays_verified": bool(row_contracts) and all(item["checkpoint_replay"] for item in row_contracts),
+        "all_m3_strong_policies_verified": bool(row_contracts) and all(item["m3_strong_policy"] for item in row_contracts),
+        "all_query_probes_present": bool(row_contracts) and all(item["query_probe_present"] for item in row_contracts),
+        "lifecycle_scopes_present": bool(shared_components.get("common_baseline")) and bool(shared_components.get("reference_repeat")),
+    }
+    execution_contract["passed"] = all(execution_contract.values())
     return {
         "run_path": str(run.resolve()),
         "expected_instances": expected,
@@ -210,6 +275,7 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
             expected is not None
             and len(rows) == expected
             and len({row.get("instance_id") for row in rows}) == len(rows)
+            and execution_contract["passed"]
             and all(
                 all(
                     arm in row.get("arms", {})
@@ -227,7 +293,7 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
             "count": len(probes),
             "evidence_complete": sum(item["evidence_complete"] for item in probes),
             "deleted_source_exposed": sum(item["deleted_source_exposed"] for item in probes),
-            "llm_calls": sum(item["llm_calls"] for item in probes),
+            "llm_calls": _sum_optional([item["llm_calls"] for item in probes]),
             "input_tokens": (
                 sum(item["input_tokens"] for item in probes)
                 if probes and all(item["input_tokens"] is not None for item in probes)
@@ -238,6 +304,19 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                 if probes and all(item["output_tokens"] is not None for item in probes)
                 else None
             ),
+            # Score reconstruction is extra audit work, separate from the
+            # adapter's retrieval/embedding counters.  Keep these totals in
+            # the formal review so the instrumentation overhead cannot be
+            # mistaken for free observation.
+            "instrumentation_cost": {
+                field: _sum_optional(
+                    [
+                        _optional_int(item.get("instrumentation_cost", {}).get(field))
+                        for item in probes
+                    ]
+                )
+                for field in _INSTRUMENTATION_FIELDS
+            },
             "query_cost_complete": bool(probes) and all(item["query_cost_observed"] for item in probes),
             "query_isolation_complete": bool(probes) and all(item["query_isolated"] for item in probes),
             "continuation_checks_passed": sum(
@@ -256,6 +335,7 @@ def _load_run(name: str, run: Path, expected: int | None) -> dict[str, Any]:
                 item["continuation_checks_passed"] for item in probes
             ),
         },
+        "execution_contract": execution_contract,
         "fingerprint": fingerprint,
         "cost_summary": cost_summary,
         "cost_summary_sha256": _hash(cost_summary_path) if cost_summary_path.exists() else None,

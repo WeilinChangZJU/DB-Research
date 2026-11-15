@@ -134,6 +134,10 @@ class AmemAdapter(MemoryAdapter):
         self.llm = llm
         self.embedder = embedder
         self.retrieve_k = retrieve_k
+        # Forks currently preserve the provider object rather than replaying
+        # cached responses.  Expose this explicitly so paired runs cannot
+        # silently claim stochastic replay equivalence.
+        self.provider_fork_mode = "fresh_provider"
         self._progress = TurnProgress("A-MEM", enabled=progress)
         self._system_class = RobustAgenticMemorySystem
         self._retriever_class = SimpleEmbeddingRetriever
@@ -223,6 +227,7 @@ class AmemAdapter(MemoryAdapter):
         clone._system_class = self._system_class
         clone._retriever_class = self._retriever_class
         clone._system = self._create_system()
+        clone.provider_fork_mode = "shared_provider_unreplayed"
         source_system = self._system
         target_system = clone._system
         target_system.memories = copy.deepcopy(getattr(source_system, "memories", {}))

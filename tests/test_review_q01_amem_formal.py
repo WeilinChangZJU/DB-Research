@@ -65,4 +65,45 @@ def test_reviewer_reports_paired_full_cost_and_components(tmp_path):
     assert m1["maintenance_wall_time_ms"] == 2.5
     assert m1["baseline_setup_wall_time_ms"] == 10.0
     assert m1["full_replayed_events"] == 12
+    assert m1["mismatched_instances"] == ["h0"]
+    assert report["complete"] is False
+    assert report["execution_contract"]["passed"] is False
+
+
+def test_reviewer_keeps_missing_query_call_count_unknown(tmp_path):
+    run = tmp_path / "run"
+    instances = run / "checkpoints" / "instances"
+    instances.mkdir(parents=True)
+    row = {
+        "instance_id": "h0",
+        "arms": {
+            "M0_full_rebuild": {
+                "exact_to_m0": True,
+                "cost": _cost(),
+                "metadata": {},
+                "query_probe": {
+                    "records": [
+                        {
+                            "question_id": "q0",
+                            "query_cost_observed": False,
+                            "instrumentation_cost": {
+                                "score_encode_calls": 1,
+                                "score_matrix_rows": 2,
+                                "score_matrix_values": 6,
+                            },
+                        }
+                    ]
+                },
+            }
+        },
+    }
+    (instances / "h0.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    report = _load_run("locomo", run, expected=1)
+    assert report["query_probes"]["llm_calls"] is None
+    assert report["query_probes"]["query_cost_complete"] is False
+    assert report["query_probes"]["instrumentation_cost"] == {
+        "score_encode_calls": 1,
+        "score_matrix_rows": 2,
+        "score_matrix_values": 6,
+    }
 

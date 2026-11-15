@@ -116,6 +116,10 @@ class AmemResearchWrapper(MemoryBackend):
         self._llm_trace: list[dict[str, Any]] = []
         self._query_records: list[CanonicalQuery] = []
         self._logical_ids: dict[str, str] = {}
+        # Physical object IDs can be updated in place by A-MEM.  Keep the
+        # version visible in dependency traces so an update reads the old
+        # version and writes a new one instead of creating a self-cycle.
+        self._object_versions: dict[str, str] = {}
         self._trace_context: dict[str, Any] = {
             "instance_id": "unknown",
             "base_instance_id": "unknown",
@@ -124,6 +128,7 @@ class AmemResearchWrapper(MemoryBackend):
             "phase": "unknown",
         }
         self._checkpoints: dict[int, "AmemResearchWrapper"] = {}
+        self._provider_fork_mode = getattr(self.adapter, "provider_fork_mode", "unknown")
 
     def fork(self, *, trace: Any | None = None) -> "AmemResearchWrapper":
         """Fork the already-built runtime without re-observing provider input.
@@ -157,8 +162,10 @@ class AmemResearchWrapper(MemoryBackend):
         clone._llm_trace = copy.deepcopy(self._llm_trace)
         clone._query_records = copy.deepcopy(self._query_records)
         clone._logical_ids = copy.deepcopy(self._logical_ids)
+        clone._object_versions = copy.deepcopy(self._object_versions)
         clone._trace_context = copy.deepcopy(self._trace_context)
         clone._checkpoints = {}
+        clone._provider_fork_mode = getattr(adapter, "provider_fork_mode", "unknown")
         return clone
 
     def _save_checkpoint(self, event_count: int) -> None:
@@ -489,6 +496,15 @@ class AmemResearchWrapper(MemoryBackend):
             "lineage_coverage": False,
             "retrieval_score_coverage": False,
             "unmapped_context_hash": None,
+            # ``score_indices`` is an audit hook rather than part of the
+            # adapter's retrieval API.  Keep its extra work explicit so a
+            # score-complete trace cannot be mistaken for zero-overhead
+            # instrumentation.
+            "instrumentation_cost": {
+                "score_encode_calls": 0,
+                "score_matrix_rows": 0,
+                "score_matrix_values": 0,
+            },
         }
 
         def map_rendered_context(rendered: str) -> None:
@@ -563,9 +579,13 @@ class AmemResearchWrapper(MemoryBackend):
                 import numpy as np
 
                 query_embedding = np.asarray(model.encode([query]))[0]
+                instrumentation = captured["instrumentation_cost"]
+                instrumentation["score_encode_calls"] += 1
                 matrix = np.asarray(embeddings)
                 if matrix.ndim != 2:
                     return
+                instrumentation["score_matrix_rows"] += int(matrix.shape[0])
+                instrumentation["score_matrix_values"] += int(matrix.size)
                 norm = float(np.linalg.norm(query_embedding))
                 if norm == 0:
                     return
@@ -735,6 +755,11 @@ class AmemResearchWrapper(MemoryBackend):
             for note_id in captured_candidates
             for source in self._object_support.get(note_id, set())
         )
+        candidate_versions = {
+            note_id: self._object_versions[note_id]
+            for note_id in captured_candidates
+            if note_id in self._object_versions
+        }
         for object_id in object_ids:
             self._object_support.setdefault(object_id, set()).update(support_sources)
         if captured_candidates:
@@ -753,6 +778,7 @@ class AmemResearchWrapper(MemoryBackend):
                 metadata={
                     "capture_mode": "find_related_memories_hook",
                     "candidate_order": list(captured_candidates),
+                    "candidate_versions": candidate_versions,
                     "scores_available": False,
                     "index_before": index_before,
                     "index_after": index_after,
@@ -764,6 +790,11 @@ class AmemResearchWrapper(MemoryBackend):
             "update": ProvenanceEventType.UPDATE,
             "noop": ProvenanceEventType.NOOP,
         }[decision]
+        object_versions = {
+            object_id: f"{_hash_text(after[f'note:{object_id}'].content)[:16]}@{self._step + 1}"
+            for object_id in object_ids
+            if f"note:{object_id}" in after
+        }
         self._next_event(
             event_type,
             source_ids=sorted(support_sources),
@@ -781,6 +812,8 @@ class AmemResearchWrapper(MemoryBackend):
                 "timestamp": turn.timestamp,
                 "current_source_id": sid,
                 "content_support_ids": sorted(support_sources),
+                "object_versions": object_versions,
+                "candidate_versions": candidate_versions,
                 "llm_calls": list(llm_calls),
                 "index_before": index_before,
                 "index_after": index_after,
@@ -792,6 +825,7 @@ class AmemResearchWrapper(MemoryBackend):
         )
         for support_source in support_sources:
             self._source_to_objects.setdefault(support_source, set()).update(object_ids)
+        self._object_versions.update(object_versions)
         source = SourceRecord(
             source_id=sid,
             content=turn.text,
@@ -1101,6 +1135,8 @@ class AmemResearchWrapper(MemoryBackend):
             "observed_dependency_graph": observed_graph.to_dict(),
             "index": self._index_summary(self._system()),
             "runtime": self._runtime_summary(self._system()),
+            "provider_fork_mode": self._provider_fork_mode,
+            "provider_replay_deterministic": self._provider_fork_mode == "request_key_replay",
             "supports": {
                 "snapshot": True,
                 "introspect": True,
@@ -1126,7 +1162,7 @@ class AmemResearchWrapper(MemoryBackend):
             "limitations": [
                 "The upstream adapter does not expose its parsed LLM branch decision.",
                 "Candidate/control dependencies are observed at the find_related_memories boundary.",
-                "Stock A-MEM has no source-level delete; M0-M3 use fresh instances and replay.",
+                "Stock A-MEM has no source-level delete; M0 uses independent rebuilds and M1-M3 use isolated runtime forks/checkpoints.",
                 "Stock note UUIDs are physical IDs; canonical cross-run equality requires the Q01 state normalizer.",
                 "Official robust A-MEM exposes no queue/cache hooks in the stock runtime.",
             ],
@@ -1150,7 +1186,7 @@ class AmemResearchWrapper(MemoryBackend):
         forget = getattr(self.adapter, "forget", None)
         if not callable(forget):
             raise NotImplementedError(
-                "A-MEM stock adapter has no source-level forget/delete API; use a fresh factory and M0-M3 replay."
+                "A-MEM stock adapter has no source-level forget/delete API; use the paired M0-M3 maintenance runner."
             )
         result = forget(list(source_ids))
         if isinstance(result, ForgetResult):
@@ -1187,11 +1223,15 @@ class AmemHistoryBuilder:
         retrieve_k: int = 10,
         trace: Any | None = None,
         trace_context: Mapping[str, Any] | None = None,
+        m3_mode: str = "materialized",
     ):
         self.factory = factory
         self.retrieve_k = retrieve_k
         self.trace = trace
         self.trace_context = dict(trace_context or {})
+        if m3_mode not in {"materialized", "conservative_full"}:
+            raise ValueError(f"unknown m3_mode: {m3_mode}")
+        self.m3_mode = m3_mode
 
     def _new(self) -> AmemResearchWrapper:
         wrapper = AmemResearchWrapper(self.factory(), retrieve_k=self.retrieve_k, trace=self.trace)
@@ -1447,12 +1487,21 @@ class AmemHistoryBuilder:
         # derived object supported by the deletion.  Keeping these start
         # policies separate is essential; otherwise M3 is only a relabelled
         # copy of M2.
+        materialized_start = self._earliest_affected_index(events, deleted, baseline)
         if arm is MaintenanceArm.M2_REPLAY:
             start = self._earliest_deleted_source_index(events, deleted)
             replay_mode = "conservative_suffix"
         else:
-            start = self._earliest_affected_index(events, deleted, baseline)
-            replay_mode = "read_control_closure"
+            if self.m3_mode == "conservative_full":
+                # A complete generic dependency baseline must remain correct
+                # when a query/NOOP/control dependency was not materialized.
+                # The conservative barrier is event zero: re-execute every
+                # retained event from the empty runtime checkpoint.
+                start = 0
+                replay_mode = "conservative_full_history"
+            else:
+                start = materialized_start
+                replay_mode = "read_control_closure"
         wrapper, checkpoint_bytes = baseline.wrapper.fork_checkpoint(start, trace=self.trace)
         wrapper.set_trace_context(arm=arm.value, phase="maintenance")
         suffix_result = self.build(
@@ -1469,9 +1518,22 @@ class AmemHistoryBuilder:
                 "affected_steps": [step.index for step in baseline.trace if step.index >= start],
                 "replay_mode": replay_mode,
                 "m3_status": (
-                    "limited_materialized_read_control_checkpoint_replay"
+                    (
+                        "strong_conservative_full_history_checkpoint_replay"
+                        if self.m3_mode == "conservative_full"
+                        else "limited_materialized_read_control_checkpoint_replay"
+                    )
                     if arm is MaintenanceArm.M3_READ_SET
                     else "conservative_suffix_checkpoint_replay"
+                ),
+                "m3_mode": self.m3_mode if arm is MaintenanceArm.M3_READ_SET else None,
+                "materialized_candidate_start": materialized_start if arm is MaintenanceArm.M3_READ_SET else None,
+                "dependency_baseline": (
+                    "complete_conservative_barrier"
+                    if arm is MaintenanceArm.M3_READ_SET and self.m3_mode == "conservative_full"
+                    else "materialized_read_control_set"
+                    if arm is MaintenanceArm.M3_READ_SET
+                    else None
                 ),
                 "checkpoint_restored": True,
                 "checkpoint_source": "shared_baseline_runtime",
@@ -1643,6 +1705,7 @@ def run_amem_all_arms(
     retrieve_k: int = 10,
     trace: Any | None = None,
     trace_context: Mapping[str, Any] | None = None,
+    m3_mode: str = "materialized",
 ) -> dict[MaintenanceArm, tuple[AmemHistoryResult, StateComparison]]:
     """Run the four fixed arms through a source-aware A-MEM wrapper."""
     builder = AmemHistoryBuilder(
@@ -1650,6 +1713,7 @@ def run_amem_all_arms(
         retrieve_k=retrieve_k,
         trace=trace,
         trace_context=trace_context,
+        m3_mode=m3_mode,
     )
     deleted = tuple(dict.fromkeys(deleted_ids))
     reference_started = time.perf_counter()

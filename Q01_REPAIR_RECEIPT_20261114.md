@@ -9,8 +9,10 @@ that Q01 is scientifically established.
 
 > Supersession note (2026-11-15): the prefix-replay observations below are
 > historical evidence from the pre-checkpoint implementation. The current
-> source uses runtime checkpoint forks for A-MEM M2/M3, records restore cost
-> separately, and labels M3 as a limited materialized dependency baseline.
+> source uses runtime checkpoint forks for A-MEM M2/M3, records restore and
+> instrumentation cost separately, and exposes an explicit M3 policy. Formal
+> runs default to the conservative full-history checkpoint baseline; the
+> materialized policy remains diagnostic and is labelled limited.
 
 ## Completed changes
 
@@ -30,9 +32,11 @@ that Q01 is scientifically established.
   relation multiplicity. Physical UUID churn is ignored; embedding, index, and
   runtime-counter changes are observable when the continuation contract covers
   them.
-- Separated deterministic M2 conservative suffix replay from M3 materialized
-  read/control invalidation. Both currently rebuild the prefix and suffix, so
-  `checkpoint_restored=false` and `maintenance_full_execution` are recorded.
+- Separated M2 conservative suffix replay from the explicit M3 policies. The
+  formal `conservative_full` policy replays the complete retained history from
+  an executable empty checkpoint; `materialized` remains a diagnostic
+  read/control-closure policy. Restore, replay, and score-reconstruction
+  instrumentation costs are recorded separately.
 - Added run fingerprints, exclusive worker ownership for the answer-level
   runner, resumable cost loading, and an explicit serial source-level A-MEM
   paired runner.
@@ -69,9 +73,11 @@ quality or deployment results.
   complete source-history JSONL.
 - Compare M0, M1, M2, and M3 on at least two independent real workloads under
   one frozen deletion and state contract. Report history-clustered uncertainty.
-- Add executable checkpoint restoration before claiming a checkpoint-based
-  efficiency improvement. The current M2/M3 prefix is re-ingested and fully
-  charged.
+- Treat the in-memory checkpoint fork as valid only for the paired run that
+  created it; exported JSON is an audit snapshot, not a durable runtime
+  restore artifact. Do not claim an efficiency improvement until the
+  conservative M3 gate, provider replay stability, and complete lifecycle
+  costs pass on real workloads.
 - Verify final-context mapping, queue/cache state, and physical-index
   restoration for each target builder. Unsupported hooks must remain
   `unknown`/`incomplete`.

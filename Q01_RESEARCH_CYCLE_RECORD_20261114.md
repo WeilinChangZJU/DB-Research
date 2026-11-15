@@ -49,6 +49,34 @@
   superiority claim. A complete generic M3 and real-workload rerun remain
   explicit gates.
 
+### 2026-11-15 — formal-freeze, strong-M3, and cost-observability closure
+
+- Formal source freezing now verifies the pinned official A-MEM git commit,
+  source-file digests, input hashes, model/embedding configuration, and the
+  canonical source-tree digest that excludes VCS/cache/output metadata. The
+  freeze builder refuses non-git or wrong-commit checkouts and emits only
+  non-secret settings.
+- The paired A-MEM runner exposes `m3_mode=conservative_full` as its formal
+  default. It restores the empty executable checkpoint and replays every
+  retained event, giving the reviewer an explicit conservative correctness
+  baseline. `m3_mode=materialized` remains available only as a limited
+  read/control-closure diagnostic. The formal reviewer now requires the
+  strong M3 marker before a run can be marked complete.
+- Retrieval score reconstruction is no longer hidden in the evidence hook:
+  encode calls, score-matrix rows, and score-matrix values are stored in query
+  records and lifecycle cost summaries. A-MEM forks expose whether provider
+  responses were request-key replayed or shared without replay; the latter is
+  treated as an explicit limitation rather than silently deterministic.
+- Dependency graph object versions now retain logical aliases without adding
+  decision/object self-cycles. History generators reject duplicate/empty
+  deletion masks and missing provenance manifest fields. The freeze, reviewer,
+  M3-policy, instrumentation, and dependency regressions pass together with
+  `91` platform tests and `compileall`.
+- Research decision remains `PROMISING / UNVERIFIED`. The platform is ready
+  for a newly frozen, cost-bounded real-workload run, but no Q01 validity,
+  efficiency advantage, or method superiority claim is inferred from these
+  engineering checks.
+
 ## Append-only updates
 
 ### 2026-11-14 — G0/P0/P1/P2/P3 repair checkpoint

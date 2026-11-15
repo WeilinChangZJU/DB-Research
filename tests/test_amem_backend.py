@@ -206,6 +206,35 @@ def test_amem_checkpoint_replay_restores_before_deleted_event_without_prefix_rei
         assert result.wrapper.adapter._system.memories
 
 
+def test_amem_m3_conservative_full_mode_is_explicit_and_separate_from_materialized_mode():
+    events = [
+        SourceEvent("e0", "src-a", "alpha", timestamp="t0"),
+        SourceEvent("e1", "src-b", "beta", timestamp="t1"),
+        SourceEvent("e2", "src-c", "gamma", timestamp="t2"),
+    ]
+    strong = run_amem_all_arms(
+        events,
+        ["src-a"],
+        _StubAmemAdapter,
+        m3_mode="conservative_full",
+    )
+    limited = run_amem_all_arms(
+        events,
+        ["src-a"],
+        _StubAmemAdapter,
+        m3_mode="materialized",
+    )
+    strong_result = strong[MaintenanceArm.M3_READ_SET][0]
+    limited_result = limited[MaintenanceArm.M3_READ_SET][0]
+    assert strong_result.metadata["m3_mode"] == "conservative_full"
+    assert strong_result.metadata["replay_mode"] == "conservative_full_history"
+    assert strong_result.metadata["m3_status"] == "strong_conservative_full_history_checkpoint_replay"
+    assert strong_result.metadata["replay_start"] == 0
+    assert limited_result.metadata["m3_mode"] == "materialized"
+    assert limited_result.metadata["replay_mode"] == "read_control_closure"
+    assert limited_result.metadata["m3_status"] == "limited_materialized_read_control_checkpoint_replay"
+
+
 def test_amem_canonical_snapshot_ignores_physical_note_ids():
     def build_state():
         backend = AmemResearchWrapper(_StubAmemAdapter(), retrieve_k=2)
@@ -237,6 +266,34 @@ def test_amem_llm_hook_records_query_chat_usage():
     query_calls = [call for call in backend.introspect()["llm_trace"] if call["call_kind"] == "query_answer"]
     assert query_calls and query_calls[-1]["input_tokens"] == 11 and query_calls[-1]["output_tokens"] == 7
     assert any(event.event_type.value == "llm_call" for event in backend.decision_events)
+
+
+def test_amem_query_reports_score_reconstruction_instrumentation_cost():
+    class _RetrievalSystem(_System):
+        def __init__(self):
+            super().__init__()
+            model = SimpleNamespace(encode=lambda texts: np.asarray([[1.0, 0.0] for _ in texts]))
+            retriever = SimpleNamespace(
+                model=model,
+                embeddings=np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+            )
+            retriever.search = lambda query, k=5: [0]
+            self.retriever = retriever
+
+        def find_related_memories(self, query: str, k: int = 5):
+            return "", self.retriever.search(query, k)
+
+    class _RetrievalAdapter(_StubAmemAdapter):
+        def reset(self):
+            self._system = _RetrievalSystem()
+
+    backend = AmemResearchWrapper(_RetrievalAdapter(), retrieve_k=1)
+    backend.observe(Turn(speaker="user", text="a fact", timestamp="t0"), source_id="src-a")
+    result = backend.query("fact")
+    instrumentation = result.evidence.details["instrumentation_cost"]
+    assert instrumentation["score_encode_calls"] == 1
+    assert instrumentation["score_matrix_rows"] == 2
+    assert instrumentation["score_matrix_values"] == 4
 
 
 def test_amem_index_summary_hashes_rendered_document_keys():

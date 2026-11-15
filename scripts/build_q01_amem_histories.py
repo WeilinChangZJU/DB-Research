@@ -39,6 +39,9 @@ def _mask_ordinals(count: int, policy: str) -> list[int]:
 
 def _history_payload(instance: Any, source_path: Path, source_file_sha256: str, policy: str) -> dict[str, Any]:
     records = list(instance.source_records)
+    source_ids = [str(record.source_id) for record in records]
+    if len(set(source_ids)) != len(source_ids):
+        raise ValueError(f"history {instance.instance_id} contains duplicate source IDs")
     ordinals = _mask_ordinals(len(records), policy)
     events: list[dict[str, Any]] = []
     for ordinal, record in enumerate(records):

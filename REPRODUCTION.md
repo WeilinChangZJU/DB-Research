@@ -6,9 +6,13 @@ This repository contains the latest source code for the Q01 validation platform.
 - **M1**: live source tombstone/filter with retriever rebuild and no repair.
 - **M2**: conservative suffix replay from a runtime checkpoint immediately
   before the earliest deleted source.
-- **M3**: materialized read/control-closure checkpoint baseline. It is labelled
-  limited until query invalidation, NOOP predicate scope, output-stability
-  propagation, and complete input memoization are implemented.
+- **M3**: explicit dependency-baseline policy. The formal runner defaults to
+  `m3_mode=conservative_full`, which restores the empty checkpoint and replays
+  the complete retained history as a conservative correctness baseline. The
+  optional `m3_mode=materialized` policy restores the earliest observed
+  read/control boundary and is labelled limited because query invalidation,
+  NOOP predicate scope, output-stability propagation, and complete input
+  memoization are not claimed.
 
 The repository intentionally does not contain benchmark datasets, API keys, large experiment results, or provider logs. Obtain the datasets separately and keep them outside Git. Never commit `.env`, API keys, raw traces, or generated JSONL histories that contain source text.
 
@@ -112,7 +116,22 @@ The helper refuses to create a row unless the frozen deleted source lies in the 
 
 ## 4. Freeze configuration and run serial M0–M3
 
-The formal orchestrator verifies the agent model, embedding backend/model, input hashes, official A-MEM source hashes, and the source-tree digest before starting. Prepare a local freeze JSON from the repository template or a reviewed run receipt; paths and hashes must describe the files on the current machine.
+The formal orchestrator verifies the agent model, embedding backend/model, input hashes, official A-MEM commit and source hashes, and the source-tree digest before starting. Generate the freeze JSON from the actual files on the current machine; do not hand-edit hashes:
+
+```bash
+PYTHONPATH=. uv run python scripts/build_q01_amem_freeze.py \
+  --amem "$BEMULA_AMEM_PATH" \
+  --locomo ../q01_inputs/locomo_explicit_histories.jsonl \
+  --longmemeval ../q01_inputs/longmemeval_s_explicit_histories.jsonl \
+  --embedding-backend local \
+  --embedding-model sentence-transformers/all-MiniLM-L6-v2 \
+  --out ../q01_freeze/freeze.json
+```
+
+The helper refuses a non-git A-MEM directory or a checkout other than the
+pinned commit.  The receipt records the endpoint URL and thinking mode when
+provided; it never records an API key.  A freeze receipt is local run state
+and must remain outside Git.
 
 Run LoCoMo first and LongMemEval-S second. `--limit 1` means one history, not one event; use the focused-window inputs above to keep a real pilot affordable:
 
@@ -174,8 +193,11 @@ The reviewer emits JSON and Markdown. Check all of the following before interpre
    probe. A failed isolation or incomplete context mapping is an execution
    limitation, not evidence that the deletion method is wrong or successful.
 7. M2/M3 replay mode, checkpoint restoration, and status are read from
-per-arm metadata. A label alone is not evidence that a general exact
-dependency baseline has been proved; the current M3 status is intentionally
+per-arm metadata. Formal review requires the conservative M3 status
+`strong_conservative_full_history_checkpoint_replay` and the
+`complete_conservative_barrier` dependency-baseline marker. A label alone is
+not evidence that a new algorithm is superior; the materialized policy remains
+diagnostic and is labelled
 `limited_materialized_read_control_checkpoint_replay`.
 
 For a focused pilot, the correct scientific interpretation is execution evidence only. It does not estimate natural occurrence rates, establish generality, prove novelty, or justify a superiority claim. Calibrate repeated M0 variability before attributing real-model mismatches to maintenance.

@@ -17,8 +17,11 @@ Current research status: the earlier focused real-provider pilot remains
 The current source has since been repaired so that M0 uses an independent
 repeat, M1--M3 share one forkable baseline, M2/M3 use runtime checkpoints
 instead of hidden prefix re-ingestion, and visible/runtime comparison layers
-are reported separately. The materialized-dependency M3 is still explicitly
-limited; no general exact-dependency or superiority claim is made.
+are reported separately. The formal runner defaults to the explicit
+`m3_mode=conservative_full` checkpoint policy, which replays the complete
+retained history as a conservative correctness baseline. The optional
+`m3_mode=materialized` policy remains a limited diagnostic baseline; no
+general exact-dependency or superiority claim is made.
 
 ## Setup
 
@@ -213,3 +216,8 @@ for cost-bounded pilots; selected item IDs and continuation checks are stored
 in each row. Set a larger explicit limit for a question-complete evaluation.
 answer-level `scripts/run_research_eval.py` remains a separate behavior runner
 and is not a substitute for the Q01 M0--M3 matrix.
+
+For a formal run, first create the local freeze receipt with
+`scripts/build_q01_amem_freeze.py`. It verifies the external A-MEM checkout is
+at the pinned commit and records input/source/model hashes without copying
+datasets, credentials, or results into this repository.

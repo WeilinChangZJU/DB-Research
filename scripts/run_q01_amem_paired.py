@@ -53,7 +53,7 @@ def _iter_histories(path: Path):
             if not isinstance(item, dict) or not isinstance(item.get("instance_id"), str):
                 raise ValueError(f"invalid history at {path}:{line_no}")
             raw_events = item.get("events")
-            if not isinstance(raw_events, list):
+            if not isinstance(raw_events, list) or not raw_events:
                 raise ValueError(f"history {item['instance_id']} must contain an events list")
             events = []
             for index, raw in enumerate(raw_events):
@@ -78,11 +78,22 @@ def _iter_histories(path: Path):
                         ),
                     )
                 )
-            deleted = tuple(dict.fromkeys(str(value) for value in item.get("deleted_source_ids", [])))
+            event_ids = [event.event_id for event in events]
+            if len(set(event_ids)) != len(event_ids):
+                raise ValueError(f"history {item['instance_id']} contains duplicate event IDs")
+            raw_deleted = item.get("deleted_source_ids", [])
+            if not isinstance(raw_deleted, list):
+                raise ValueError(f"history {item['instance_id']} deleted_source_ids must be a list")
+            deleted = tuple(dict.fromkeys(str(value) for value in raw_deleted))
             source_ids = {event.source_id for event in events}
+            if len(source_ids) != len(events):
+                raise ValueError(f"history {item['instance_id']} contains duplicate source IDs")
             unknown = sorted(set(deleted) - source_ids)
             if unknown:
                 raise ValueError(f"history {item['instance_id']} deletes unknown source IDs: {unknown}")
+            raw_items = item.get("items", [])
+            if not isinstance(raw_items, list):
+                raise ValueError(f"history {item['instance_id']} items must be a list")
             yield {
                 "instance_id": item["instance_id"],
                 "base_instance_id": str(item.get("base_instance_id", item["instance_id"])),
@@ -91,7 +102,7 @@ def _iter_histories(path: Path):
                 "mask_policy": item.get("mask_policy", item.get("mask_policy_version")),
                 "events": events,
                 "deleted_source_ids": deleted,
-                "items": list(item.get("items", [])),
+                "items": list(raw_items),
             }
 
 
@@ -229,6 +240,17 @@ def _probe_query(
         "retrieved_items": len(details.get("candidate_ids", [])),
         "memory_reads": len(evidence.read_set),
     }
+    instrumentation_cost = details.get("instrumentation_cost", {})
+    if isinstance(instrumentation_cost, dict):
+        # These counters represent extra score reconstruction performed by
+        # the audit hook.  They are intentionally kept separate from the
+        # adapter's retrieval/embedding counters and included in lifecycle
+        # cost summaries rather than silently folded into zero.
+        for name in ("score_encode_calls", "score_matrix_rows", "score_matrix_values"):
+            value = instrumentation_cost.get(name)
+            if isinstance(value, (int, float)):
+                counters[f"instrumentation_{name}"] = value
+    record["instrumentation_cost"] = instrumentation_cost
     if input_tokens is not None:
         counters["input_tokens"] = input_tokens
     if output_tokens is not None:
@@ -242,6 +264,12 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--baseline", default="amem")
     parser.add_argument("--retrieve-k", type=int, default=10)
+    parser.add_argument(
+        "--m3-mode",
+        choices=("materialized", "conservative_full"),
+        default="conservative_full",
+        help="M3 dependency policy; conservative_full is the correctness baseline.",
+    )
     parser.add_argument(
         "--query-limit",
         type=int,
@@ -264,7 +292,9 @@ def main() -> int:
     history_stream = _iter_histories(args.histories)
     if args.limit is not None:
         history_stream = islice(history_stream, args.limit)
-    root = Path.cwd().resolve()
+    root = Path(
+        os.environ.get("BEMULA_SOURCE_ROOT", Path(__file__).resolve().parents[1])
+    ).resolve()
     store = CheckpointStore(args.out)
     tree_digest = sha256_tree(root, exclude=(".venv", ".git", "results"))
     fingerprint = {
@@ -275,9 +305,16 @@ def main() -> int:
         "retrieve_k": args.retrieve_k,
         "effective_serve_k": args.retrieve_k,
         "query_limit": args.query_limit,
+        "m3_mode": args.m3_mode,
         "repository_tree_sha256": tree_digest,
         "agent_model": args.agent_model,
         "embed_backend": os.environ.get("BEMULA_EMBED_BACKEND", "api"),
+        "freeze_sha256": os.environ.get("BEMULA_FREEZE_SHA256"),
+        "official_amem_commit": os.environ.get("BEMULA_AMEM_COMMIT"),
+        "official_amem_source_tree_sha256": os.environ.get(
+            "BEMULA_AMEM_SOURCE_TREE_SHA256"
+        ),
+        "model_config_sha256": os.environ.get("BEMULA_MODEL_CONFIG_SHA256"),
     }
     store.ensure_fingerprint(fingerprint)
     done = store.completed_ids(validate=True) if args.resume else set()
@@ -308,6 +345,7 @@ def main() -> int:
             instance["deleted_source_ids"],
             factory,
             retrieve_k=args.retrieve_k,
+            m3_mode=args.m3_mode,
             trace=trace,
             trace_context={
                 "instance_id": instance_id,

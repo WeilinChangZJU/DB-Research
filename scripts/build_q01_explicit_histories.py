@@ -36,27 +36,30 @@ def _event_hash(events: list[dict[str, Any]]) -> str:
 def _source_events(instance: Any) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for index, record in enumerate(instance.source_records):
+        record_metadata = dict(getattr(record, "metadata", {}) or {})
+        speaker = getattr(record, "speaker", None) or record_metadata.get("speaker")
+        session_id = getattr(record, "session_id", None) or record_metadata.get("session_id")
         events.append(
             {
                 "event_id": record.source_id,
                 "source_id": record.source_id,
                 "content": record.text,
                 "timestamp": record.timestamp or "",
-                "speaker": getattr(record, "speaker", None) or (record.metadata or {}).get("speaker"),
-                "session_id": getattr(record, "session_id", None) or (record.metadata or {}).get("session_id"),
+                "speaker": speaker,
+                "session_id": session_id,
                 "metadata": {
-                    **dict(record.metadata),
-                    "dataset": record.dataset,
-                    "instance_id": record.instance_id,
-                    "speaker": record.speaker,
-                    "ordinal": record.ordinal,
-                    "source_hash": record.source_hash,
+                    **record_metadata,
+                    "dataset": getattr(record, "dataset", getattr(instance, "dataset", "")),
+                    "instance_id": getattr(record, "instance_id", getattr(instance, "instance_id", "")),
+                    "speaker": speaker,
+                    "ordinal": getattr(record, "ordinal", index),
+                    "source_hash": getattr(record, "source_hash", ""),
                     "event_ordinal": index,
                 },
             }
         )
-        events[-1]["metadata"].setdefault("speaker", getattr(record, "speaker", None))
-        events[-1]["metadata"].setdefault("session_id", getattr(record, "metadata", {}).get("session_id"))
+        events[-1]["metadata"].setdefault("speaker", speaker)
+        events[-1]["metadata"].setdefault("session_id", session_id)
     return events
 
 
@@ -69,6 +72,10 @@ def _evidence_sources(instance: Any) -> tuple[str, ...]:
 
 def _mask_rows(instance: Any, events: list[dict[str, Any]], masks: Iterable[str]) -> list[dict[str, Any]]:
     source_ids = [str(event["source_id"]) for event in events]
+    if not source_ids:
+        raise ValueError(f"history {getattr(instance, 'instance_id', '<unknown>')} has no source events")
+    if len(set(source_ids)) != len(source_ids):
+        raise ValueError(f"history {getattr(instance, 'instance_id', '<unknown>')} contains duplicate source IDs")
     evidence_ids = tuple(source_id for source_id in _evidence_sources(instance) if source_id in source_ids)
     evidence_set = set(evidence_ids)
     first_answer = evidence_ids[0] if evidence_ids else source_ids[0]

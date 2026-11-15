@@ -96,5 +96,5 @@ LoCoMo 与 LongMemEval-S 已各完成一个无模型 controlled-replay pilot；�
 
 `scripts/run_q01_amem_paired.py` 是 A-MEM source-event 闭环入口。它读取每行一个独立 history 的 JSONL，要求显式提供 `deleted_source_ids`，在同一 `H,D` 上串行运行两次独立 M0、一个共享 baseline 和 M1--M3，并写出每个 arm 的 canonical hash、状态差异、trace、成本、checkpoint 和运行 fingerprint。查询探针默认只选一个声明问题，必须通过 `--query-limit` 显式扩大；串行是第一轮的安全默认值，A-MEM adapter 是可变对象，未完成独占 worker 验证前不启用并发。
 
-M2 从共享 baseline 的运行时 checkpoint 恢复到最早删除源之前，再执行保留后缀；M3 使用 materialized read/control closure 选择失效起点，再从该 checkpoint 执行后缀。两者都把 `checkpoint_restore_events`、`checkpoint_restore_bytes` 和实际后缀执行单独计入 `maintenance_checkpoint_replay`，不会把保存语义 JSON 冒充可恢复执行状态。M3 当前明确标记为 `limited_materialized_read_control_checkpoint_replay`，尚未覆盖完整查询失效、NOOP 谓词依赖、输出稳定传播和全输入 memoization。
+M2 从共享 baseline 的运行时 checkpoint 恢复到最早删除源之前，再执行保留后缀。M3 支持两种明确模式：`materialized` 使用已物化 read/control closure，`conservative_full` 从空运行时 checkpoint 重执行全部保留事件，作为不会漏掉隐藏 NOOP/查询依赖的正确性基线；正式 runner 默认后者。两者都把 `checkpoint_restore_events`、`checkpoint_restore_bytes` 和实际后缀执行单独计入 `maintenance_checkpoint_replay`，不会把保存语义 JSON 冒充可恢复执行状态。`materialized` 模式明确标记为 `limited_materialized_read_control_checkpoint_replay`；`conservative_full` 标记为 `strong_conservative_full_history_checkpoint_replay`，但它的成本接近完整重建，不能被解释为已经获得通用依赖优化。
 
