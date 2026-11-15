@@ -71,7 +71,7 @@
   decision/object self-cycles. History generators reject duplicate/empty
   deletion masks and missing provenance manifest fields. The freeze, reviewer,
   M3-policy, instrumentation, and dependency regressions pass together with
-  `91` platform tests and `compileall`.
+  `96` platform tests and `compileall`.
 - Research decision remains `PROMISING / UNVERIFIED`. The platform is ready
   for a newly frozen, cost-bounded real-workload run, but no Q01 validity,
   efficiency advantage, or method superiority claim is inferred from these

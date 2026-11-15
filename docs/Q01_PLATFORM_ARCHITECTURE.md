@@ -84,7 +84,7 @@ CanonicalVisible(M_inc) == CanonicalVisible(M_ref)
 已完成测量基础与离线闭环：manifest、checkpoint、trace、ResearchProtocol、
 MemoryBackend、InMemoryBackend、LoCoMo/LongMemEval-S adapter、canonical
 state、dependency trace、M0–M3 maintenance API、cost vector、toy builder、
-source-level paired runner 和统一回归测试。当前平台套件为 83 项通过，
+source-level paired runner 和统一回归测试。当前平台套件为 96 项通过，
 第二轮独立审计契约在更新过时诊断断言后为 20 项通过。
 
 LoCoMo 与 LongMemEval-S 已各完成一个无模型 controlled-replay pilot；这
