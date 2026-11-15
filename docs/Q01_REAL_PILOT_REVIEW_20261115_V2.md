@@ -91,7 +91,7 @@ These figures include lifecycle scopes, reference repeat, shared baseline, maint
 
 ## v2 修复后尝试：无效 partial run
 
-新的 source-order、logical-origin 和 provider fail-fast 修复后，按同一 freeze 启动 v2：
+在修复迭代过程中按同一 freeze 启动了 v2；该子进程随后被 401 阻断，且它未形成包含最终 source-order 与 provider fail-fast 补丁的有效完成 receipt：
 
 ```text
 _q01_external/q01_runs/formal_real_focused_window_v2/locomo/runner.stderr.log
