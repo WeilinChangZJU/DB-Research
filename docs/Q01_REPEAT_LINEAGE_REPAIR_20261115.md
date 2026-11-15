@@ -27,13 +27,16 @@ M0 repeat 不稳定，以及最终注入模型的上下文无法逐片段映射�
 
 ## 代码验收
 
-Windows source snapshot 的完整测试为 **128 passed**，其中包含：
+Windows source snapshot 的完整测试为 **129 passed**，其中包含：
 
 - 冻结 temperature、cassette policy、seed 和 runner fingerprint 检查；
 - M0 repeat 请求账本命中与零 miss 检查；
 - 随机物理 UUID 的 M0 canonical repeat 检查；
 - duplicate-content、ordered-neighbor、empty-context 和 pinned renderer
   的结构化 lineage 检查。
+- provider `402 Insufficient Balance` 等账户/配额拒绝现在被识别为不可重试
+  的 external blocker，避免在余额不足时重复请求并留下更大的半成品 trace；
+  formal runner 会写出 blocker receipt 和 stderr 路径。
 
 无 API 的 pinned official A-MEM controlled runner 重新运行了 LoCoMo 与
 LongMemEval-S 各 1 个 history，串行 M0--M3、`retrieve_k=5`、

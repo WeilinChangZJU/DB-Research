@@ -13,7 +13,7 @@ import re
 from typing import Any
 
 from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 Message = dict[str, str]
 
@@ -26,6 +26,10 @@ MIN_MAX_TOKENS = 4096
 
 
 _ENV_LOADED = False
+
+
+class ProviderBudgetError(RuntimeError):
+    """A non-retryable provider rejection caused by account/budget state."""
 
 
 def load_environment_once() -> None:
@@ -204,6 +208,7 @@ class OpenAILLM(BaseLLM):
         json_mode: bool = False,
     ) -> str:
         @retry(
+            retry=retry_if_not_exception_type(ProviderBudgetError),
             stop=stop_after_attempt(self.max_retries),
             wait=wait_exponential(multiplier=1, min=2, max=30),
             reraise=True,
@@ -226,14 +231,24 @@ class OpenAILLM(BaseLLM):
                 if enforce_json and "deepseek" not in self.model.lower()
                 else {}
             )
-            resp = self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=temperature,
-                max_tokens=budget,
-                extra_body=extra,
-                **json_args,
-            )
+            try:
+                resp = self._client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,  # type: ignore[arg-type]
+                    temperature=temperature,
+                    max_tokens=budget,
+                    extra_body=extra,
+                    **json_args,
+                )
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                lowered = str(exc).lower()
+                if status_code in {402, 403} or "insufficient balance" in lowered or "insufficient funds" in lowered:
+                    raise ProviderBudgetError(
+                        "provider rejected the request because account balance/quota is insufficient "
+                        f"(status_code={status_code!r})"
+                    ) from exc
+                raise
             raw_usage = getattr(resp, "usage", None)
             if raw_usage is None:
                 self.last_usage = {}

@@ -60,10 +60,16 @@ def _git_commit(root: Path) -> str | None:
     return value or None
 
 
-def _write_blocker(path: Path, *, message: str, freeze: Path) -> None:
+def _write_blocker(
+    path: Path,
+    *,
+    message: str,
+    freeze: Path,
+    status: str = "blocked_missing_external_model_state",
+) -> None:
     payload = {
         "schema_version": 1,
-        "status": "blocked_missing_external_model_state",
+        "status": status,
         "message": message,
         "freeze_path": str(freeze.resolve()),
         "api_key_configured": bool(os.environ.get("OPENAI_API_KEY")),
@@ -317,7 +323,22 @@ def main() -> int:
             command.extend(["--limit", str(limit)])
         if args.resume:
             command.append("--resume")
-        subprocess.run(command, check=True, env=child_env)
+        stderr_path = out / "runner.stderr.log"
+        out.mkdir(parents=True, exist_ok=True)
+        try:
+            with stderr_path.open("w", encoding="utf-8") as stderr:
+                subprocess.run(command, check=True, env=child_env, stderr=stderr)
+        except subprocess.CalledProcessError as exc:
+            _write_blocker(
+                blocker_path,
+                message=(
+                    f"{name} paired runner exited with code {exc.returncode}; "
+                    f"stderr receipt: {stderr_path.resolve()}"
+                ),
+                freeze=freeze_path,
+                status="blocked_external_model_run",
+            )
+            return 3
 
     reviewer = Path(__file__).with_name("review_q01_amem_formal.py")
     subprocess.run(
